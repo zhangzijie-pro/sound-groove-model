@@ -13,7 +13,7 @@
 
 <div align="center">
 
-[中文](README_ch.md) | [English](README.md)
+[中文](Readme_ch.md) | [English](README.md)
 
 </div>
 
