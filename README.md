@@ -34,25 +34,50 @@
 ## 📂 Project Structure
 
 ```
-Sound-Groove/
-├── configs/                  # Hydra configs
-│   └── train.yaml
-├── scripts/                  # Utility scripts
-│   ├── preprocess.py         # Parallel preprocessing
-│   └── export.py             # ONNX / MNN export + model splitting
-├── dataset/                  # Datasets & samplers
+Speaker-Verification/
+├── CN-Celeb_flac/          # Original CN-Celeb dataset (FLAC/WAV)
+│
+├── processed/              # Preprocessed features & metadata
+│   └── cn_celeb2/
+│       ├── fbank_pt/       # Saved fbank features (*.pt)
+│       ├── train_fbank_list.txt
+│       ├── val_meta.jsonl  # Validation metadata (speaker, feature path)
+│       └── spk2id.json
+│
+├── configs/
+│   ├── train.yaml
+│   └── train_config.py     # Training hyperparameters
+│
+├── demos/
+│   └── app.py              # gradio web to test
+│
+├── data/
+│   ├── dataset.py          # Train / validation datasets
+│   └── pk_sampler.py       # PK batch sampler (speaker-balanced)
+│
 ├── models/
+│   └── ecapa.py            # ECAPA-TDNN implementation
+│
 ├── loss_head/
+│   └── aamsoftmax.py       # AAM-Softmax loss
+│
 ├── utils/
-│   ├── audio.py              # Audio loading & fbank extraction
-│   ├── path_utils.py
-│   └── ...
-├── demo/                     # Gradio web demo
-├── outputs/                  # Training checkpoints & curves
-├── outputs_eval/             # Evaluation results (plots, metrics)
-├── train.py                  # Training script (Hydra)
-├── verify.py                 # Full verification evaluation
-├── compare_two_wavs.py       # Compare two audio files (PT + ONNX)
+│   ├── meters.py           # Accuracy, average meters
+│   ├── seed.py             # Reproducibility
+│   ├── plot.py             # Training curves
+│   ├── path_utils.py       # Deal to path error
+│   └── audio.py            # audio process utils
+│
+├── scripts/
+│   └── export.py           # export onnx/mnn and split model, head
+│
+├── outputs/                # Training outputs (checkpoints, curves)
+├── outputs_eval/           # Verification results (EER, ROC, DET, t-SNE)
+│
+├── train.py                # Main training script
+├── verify_pairs.py         # Pairwise speaker verification
+├── compare_two_wavs.py     # Compare two audio files
+│
 ├── README.md
 ├── README_ch.md
 └── LICENSE
@@ -70,13 +95,10 @@ cd Speaker-Verification
 pip install -r requirements.txt
 ```
 
-### 2. Data Preprocessing (Run once)
+### 2. Data Preprocessing
 
 ```bash
-python scripts/preprocess.py \
-    --data_dir /path/to/CN-Celeb_flac \
-    --output_dir processed/cn_celeb2 \
-    --n_jobs 16
+python processed/preprocess_cnceleb2_train.py
 ```
 
 ### 3. Training

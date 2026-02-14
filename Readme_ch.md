@@ -34,25 +34,50 @@
 ## 📂 项目结构
 
 ```
-Sound-Groove/
-├── configs/                  # Hydra 配置
-│   └── train.yaml
-├── scripts/                  # 工具脚本
-│   ├── preprocess.py         # 并行预处理
-│   └── export.py             # ONNX / MNN 导出 + 模型拆分
-├── dataset/                  # 数据集与采样器
+Speaker-Verification/
+├── CN-Celeb_flac/          # Original CN-Celeb dataset (FLAC/WAV)
+│
+├── processed/              # Preprocessed features & metadata
+│   └── cn_celeb2/
+│       ├── fbank_pt/       # Saved fbank features (*.pt)
+│       ├── train_fbank_list.txt
+│       ├── val_meta.jsonl  # Validation metadata (speaker, feature path)
+│       └── spk2id.json
+│
+├── configs/
+│   ├── train.yaml
+│   └── train_config.py     # Training hyperparameters
+│
+├── demos/
+│   └── app.py              # gradio web to test
+│
+├── data/
+│   ├── dataset.py          # Train / validation datasets
+│   └── pk_sampler.py       # PK batch sampler (speaker-balanced)
+│
 ├── models/
+│   └── ecapa.py            # ECAPA-TDNN implementation
+│
 ├── loss_head/
+│   └── aamsoftmax.py       # AAM-Softmax loss
+│
 ├── utils/
-│   ├── audio.py              # 音频加载与 fbank 提取
-│   ├── path_utils.py
-│   └── ...
-├── demo/                     # Gradio 在线演示
-├── outputs/                  # 训练输出（检查点、曲线）
-├── outputs_eval/             # 评估结果（图表、指标）
-├── train.py                  # 训练主脚本（Hydra）
-├── verify.py                 # 完整验证评估
-├── compare_two_wavs.py       # 两个音频对比（支持 PT + ONNX）
+│   ├── meters.py           # Accuracy, average meters
+│   ├── seed.py             # Reproducibility
+│   ├── plot.py             # Training curves
+│   ├── path_utils.py       # Deal to path error
+│   └── audio.py            # audio process utils
+│
+├── scripts/
+│   └── export.py           # export onnx/mnn and split model, head
+│
+├── outputs/                # Training outputs (checkpoints, curves)
+├── outputs_eval/           # Verification results (EER, ROC, DET, t-SNE)
+│
+├── train.py                # Main training script
+├── verify_pairs.py         # Pairwise speaker verification
+├── compare_two_wavs.py     # Compare two audio files
+│
 ├── README.md
 ├── README_ch.md
 └── LICENSE
@@ -73,10 +98,7 @@ pip install -r requirements.txt
 ### 2. 数据预处理
 
 ```bash
-python scripts/preprocess.py \
-    --data_dir /path/to/CN-Celeb_flac \
-    --output_dir processed/cn_celeb2 \
-    --n_jobs 16
+python processed/preprocess_cnceleb2_train.py
 ```
 
 ### 3. 训练
