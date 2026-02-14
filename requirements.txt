@@ -1,8 +1,10 @@
 torch
+torchaudio
+numpy
+scikit-learn
 matplotlib
 tqdm
-json
-dataclasses
-collections
-torchaudio
+hydra-core
+wandb
+gradio
 onnxruntime

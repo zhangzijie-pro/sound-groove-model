@@ -3,75 +3,56 @@
 
 # 🎙️ Sound-Groove: Speaker Verification with ECAPA-TDNN
 
-
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Hugging Face Dataset](https://img.shields.io/badge/HuggingFace-Dataset-yellow)](https://huggingface.co/datasets/zzj-pro/CN_Celeb_v2)
-![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)
+[![GitHub stars](https://img.shields.io/github/stars/zhangzijie-pro/Speaker-Verification.svg?style=social)](https://github.com/zhangzijie-pro/Speaker-Verification/stargazers)
+[![Hugging Face](https://img.shields.io/badge/HuggingFace-Model%20%26%20Dataset-yellow.svg)](https://huggingface.co/zzj-pro)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c?logo=pytorch)
 ![Task](https://img.shields.io/badge/Task-Speaker%20Verification-green)
 
-
-
 <div align="center">
-
-[中文](Readme_ch.md) | [English](README.md)
-
+  <a href="Readme_ch.md">中文文档</a> • 
+  <a href="https://github.com/zhangzijie-pro/Speaker-Verification">GitHub</a> • 
+  <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
 
 > A practical speaker verification system based on **ECAPA-TDNN + AAM-Softmax**, trained and evaluated on **CN-Celeb**.
+
 ---
 
-## 📌 Features
+## ✨ Features
 
-* ✅ ECAPA-TDNN backbone (Res2Net + SE + Attentive Statistics Pooling)
-* ✅ AAM-Softmax loss for discriminative speaker embeddings
-* ✅ Speaker-balanced PK sampling
-* ✅ Verification-oriented evaluation (EER, score distribution, t-SNE)
-* ✅ Crop-average inference for stable embeddings
-* ✅ Designed for **limited GPU memory (≈6GB)**
+- **SOTA Backbone**: ECAPA-TDNN (Res2Net + SE + Attentive Statistics Pooling)
+- **Strong Discriminative Loss**: AAM-Softmax with angular margin
+- **Balanced Sampling**: PK Batch Sampler (speaker-balanced)
+- **Robust Evaluation**: EER, score distribution, t-SNE, Recall@K
+- **Stable Inference**: Multi-crop averaging for reliable embeddings
+- **Low Memory Design**: Optimized for ~6GB GPU (AMP + gradient clipping)
 
 ---
 
 ## 📂 Project Structure
 
 ```
-sound-groove-model/
-├── CN-Celeb_flac/          # Original CN-Celeb dataset (FLAC/WAV)
-│
-├── processed/              # Preprocessed features & metadata
-│   └── cn_celeb2/
-│       ├── fbank_pt/       # Saved fbank features (*.pt)
-│       ├── train_fbank_list.txt
-│       ├── val_meta.jsonl  # Validation metadata (speaker, feature path)
-│       └── spk2id.json
-│
-├── configs/
-│   └── train_config.py     # Training hyperparameters
-│
-├── data/
-│   ├── dataset.py          # Train / validation datasets
-│   ├── pk_sampler.py       # PK batch sampler (speaker-balanced)
-│   └── ...
-│
+Sound-Groove/
+├── configs/                  # Hydra configs
+│   └── train.yaml
+├── scripts/                  # Utility scripts
+│   ├── preprocess.py         # Parallel preprocessing
+│   └── export.py             # ONNX / MNN export + model splitting
+├── dataset/                  # Datasets & samplers
 ├── models/
-│   └── ecapa.py            # ECAPA-TDNN implementation
-│
-├── loss/
-│   └── aamsoftmax.py       # AAM-Softmax loss
-│
+├── loss_head/
 ├── utils/
-│   ├── meters.py           # Accuracy, average meters
-│   ├── seed.py             # Reproducibility
-│   ├── plot.py             # Training curves
+│   ├── audio.py              # Audio loading & fbank extraction
+│   ├── path_utils.py
 │   └── ...
-│
-├── outputs/                # Training outputs (checkpoints, curves)
-├── outputs_eval/           # Verification results (EER, ROC, DET, t-SNE)
-│
-├── train.py                # Main training script
-├── verify_pairs.py         # Pairwise speaker verification
-├── compare_two_wavs.py     # Compare two audio files
-├── split_pt.py / turn.py   # Utility / debug scripts
-│
+├── demo/                     # Gradio web demo
+├── outputs/                  # Training checkpoints & curves
+├── outputs_eval/             # Evaluation results (plots, metrics)
+├── train.py                  # Training script (Hydra)
+├── verify.py                 # Full verification evaluation
+├── compare_two_wavs.py       # Compare two audio files (PT + ONNX)
 ├── README.md
 ├── README_ch.md
 └── LICENSE
@@ -79,169 +60,150 @@ sound-groove-model/
 
 ---
 
-## 🧠 Model Overview
+## 🚀 Quick Start
 
-### Backbone
-
-* **ECAPA-TDNN**
-
-  * Res2Net-style temporal convolutions
-  * Squeeze-and-Excitation (SE)
-  * Attentive Statistics Pooling
-* Output embedding dimension: **192 / 256**
-
-### Loss
-
-* **AAM-Softmax (Additive Angular Margin Softmax)**
-
-  * Encourages large inter-speaker margin
-  * Used only during training
-
-### Embedding
-
-* L2-normalized speaker embeddings
-* Cosine similarity used for verification
-
----
-
-## 📊 Dataset
-
-* **CN-Celeb**
-
-  * ~1000 speakers
-  * Diverse recording conditions
-* Data split:
-
-  * `train`: speaker-disjoint training set
-  * `val`: speaker-disjoint validation set
-* Features:
-
-  * 80-dim log Mel-filterbank
-  * 16kHz sampling rate
-
----
-
-## 🔧 Preprocessing
-
-1. Convert audio to mono 16kHz
-2. Extract fbank features using `torchaudio.compliance.kaldi.fbank`
-3. Save features as `.pt` files
-4. Generate:
-
-   * `train_fbank_list.txt`
-   * `val_meta.jsonl`
-
-Each training sample:
-
-```
-<label> <absolute_path_to_fbank.pt>
-```
-
----
-
-## 🚀 Training
-
-### Run training
+### 1. Installation
 
 ```bash
-python train.py
+git clone https://github.com/zhangzijie-pro/Speaker-Verification.git
+cd Speaker-Verification
+pip install -r requirements.txt
 ```
 
-### Key training strategies
+### 2. Data Preprocessing (Run once)
 
-* **PK Sampling**
+```bash
+python scripts/preprocess.py \
+    --data_dir /path/to/CN-Celeb_flac \
+    --output_dir processed/cn_celeb2 \
+    --n_jobs 16
+```
 
-  * P speakers × K utterances per speaker
-  * Example: `P=32, K=4` → batch size = 128
-* **Random temporal cropping**
+### 3. Training
 
-  * Training crop: ~2s (`crop_frames=200`)
-* **AMP (mixed precision)** enabled
-* **Gradient clipping** for stability
+```bash
+# Train with default config
+python train.py
+
+# Override parameters via command line
+python train.py train.epochs=100 train.lr=5e-4 train.emb_dim=256
+```
 
 ---
 
 ## 📈 Evaluation (Speaker Verification)
 
-### Metrics
-
-* **EER (Equal Error Rate)** – primary metric
-* Score distribution (same vs diff)
-* t-SNE visualization of embeddings
-* Recall@K (optional, sampled)
-
-### Validation strategy
-
-* **Longer crops + multi-crop average**
-
-  * `crop_frames = 400`
-  * `num_crops = 5~10`
-* Embeddings are averaged and L2-normalized
-
-### Run verification
+### Run full evaluation
 
 ```bash
-python verify_pairs.py
+python verify.py \
+    --val_meta processed/cn_celeb2/val_meta.jsonl \
+    --ckpt outputs/best.pt \
+    --out_dir outputs_eval
 ```
 
-Outputs:
-
-* `outputs_eval/roc.png`
-* `outputs_eval/det.png`
-* `outputs_eval/score_hist.png`
-* `outputs_eval/tsne.png`
+**Outputs**:
+- `roc.png`, `det.png`, `score_hist.png`
+- `tsne.png` (speaker clustering)
+- `metrics.txt` (EER, Recall@K, etc.)
 
 ---
 
-## 🧪 Example Results (CN-Celeb)
+## 🎯 Single Audio Comparison (Most Used)
 
-* Training accuracy: **>80%**
-* Validation EER (sampled): **~20–25%**
-* Clear separation between same / different speaker scores
-* t-SNE shows clustered speaker embeddings
-
-> Note: ECAPA-TDNN is **slow to converge**. Significant EER improvement often appears after 40–80 epochs.
-
----
-
-## 🛠️ Recommended Hyperparameters (6GB GPU)
-
-```python
-emb_dim = 256
-P = 32
-K = 4
-crop_frames_train = 200
-crop_frames_val = 400
-num_crops_val = 10
-margin = 0.30 → 0.35 (later epochs)
-scale = 30 → 35
-epochs = 60–150
+```bash
+python compare_two_wavs.py \
+    --wav1 test1.wav \
+    --wav2 test2.wav \
+    --ckpt outputs/export/model.onnx   # Supports ONNX
 ```
 
 ---
 
-## 🔍 Known Limitations
+## 🛠️ Model Export (Deployment)
 
-* Validation EER still sensitive to crop length
-* No explicit noise / reverberation augmentation (yet)
-* CN-Celeb intra-speaker variability is high
+```bash
+# One-click export to ONNX + MNN
+python scripts/export.py \
+    --ckpt outputs/best.pt \
+    --out_dir outputs/deploy \
+    --onnx --mnn
+```
+
+**Supported deployment**:
+- **ONNX Runtime** (Python / C++)
+- **MNN** (Mobile / Edge)
+- **TensorRT** (High-performance server)
 
 ---
 
-## 📌 Future Improvements
+## 🧠 Model Overview
 
-* [ ] SpecAugment on fbank
-* [ ] Noise / RIR augmentation
-* [ ] Hard negative mining
-* [ ] Adaptive margin scheduling
-* [ ] ONNX / TensorRT inference export
+### Backbone
+
+- **ECAPA-TDNN**
+  - Res2Net-style temporal convolutions
+  - Squeeze-and-Excitation (SE)
+  - Attentive Statistics Pooling
+- Embedding dimension: **192 / 256**
+
+### Loss
+
+- **AAM-Softmax (Additive Angular Margin Softmax)**
+  - Encourages large inter-speaker margins
+  - Used only during training
+
+### Embedding
+
+- L2-normalized speaker embeddings
+- Cosine similarity for verification
+
+---
+
+## 📊 Dataset
+
+- **CN-Celeb**
+  - ~1000 speakers
+  - Highly diverse recording conditions
+- Split:
+  - `train`: speaker-disjoint
+  - `val`: speaker-disjoint
+- Features:
+  - 80-dim log Mel-filterbank
+  - 16kHz sampling rate
+
+---
+
+## 📌 Recommended Configuration (6GB GPU)
+
+```yaml
+# configs/train.yaml
+emb_dim: 256
+channels: 512
+lr: 1e-3
+epochs: 80
+crop_frames: 200          # Training
+crop_frames_val: 400      # Validation
+num_crops: 6
+p: 32
+k: 4
+```
+
+---
+
+## 🔮 Future Improvements
+
+- [x] Hydra configuration
+- [x] Parallel preprocessing
+- [x] ONNX / MNN export
+- [ ] Noise / RIR augmentation
 
 ---
 
 ## 📜 License
 
-This project is released under the **Apache License**.
-CN-Celeb dataset follows its original license and usage terms.
+This project is released under the **Apache License 2.0**.  
+The CN-Celeb dataset follows its original license and usage terms.
 
 ---
 
@@ -249,8 +211,6 @@ CN-Celeb dataset follows its original license and usage terms.
 
 This repository is intended for:
 
-* Learning speaker verification systems
+- Learning speaker verification systems
 
 It is **not** an off-the-shelf commercial system.
-
----
