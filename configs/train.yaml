@@ -1,0 +1,26 @@
+train_list: processed/cn_celeb2/train_fbank_list.txt
+val_list: processed/cn_celeb2/val_meta.jsonl
+
+feat_dim: 80
+channels: 512
+emb_dim: 256  # 192
+
+# AAM-Softmax
+margin: 0.40
+scale: 40.0
+
+# train
+epochs: 150
+batch_size: 128
+num_workers: 2
+lr: 3e-4
+weight_decay: 3e-5
+grad_clip: 5.0
+
+# 设备
+device: "cuda"
+amp: True
+
+# 输出
+out_dir: "outputs"
+save_best: True
