@@ -1,0 +1,47 @@
+train_list: processed/your-dataset/train_fbank_list.txt
+val_list: processed/your-dataset/val_meta.jsonl
+
+feat_dim: 80
+channels: 512
+emb_dim: 256
+
+margin: 0.40
+scale: 40.0
+
+seed: 1234
+epochs: 60
+num_workers: 2
+lr: 1e-4
+weight_decay: 3e-5
+grad_clip: 5.0
+
+device: "cuda"
+amp: True
+
+out_dir: "outputs_finetune"
+
+# PK sampler
+p: 32
+k: 4
+
+crop_frames: 200
+crop_frames_val: 400
+num_crops: 6
+max_spk: 120
+per_spk: 3
+num_pos: 3000
+num_neg: 3000
+
+sample_rate: 16000
+
+finetune:
+  # choice full_ckpt or model_only
+  pretrained_full_ckpt: "weights/best.pt"
+  pretrained_model_only: ""
+
+  load_backbone_only: true
+
+  freeze_backbone_epochs: 3
+
+  backbone_lr_mult: 0.5
+  head_lr_mult: 1.0

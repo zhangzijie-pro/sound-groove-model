@@ -9,7 +9,7 @@ import torch
 @dataclass
 class ModelCfg:
     channels: int = 512
-    emb_dim: int = 192
+    emb_dim: int = 256
     feat_dim: int = 80  # fbank mel bins
     sample_rate: int = 16000
 

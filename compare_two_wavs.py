@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="outputs/export/model.onnx",
+        default="scripts/outputs/export/model.pt",
         help="模型路径：.pt (PyTorch) 或 .onnx (ONNX)",
     )
 
