@@ -205,9 +205,10 @@ if __name__ == "__main__":
     main()
     
 """
-python real_time.py \
-  --model ../scripts/outputs/export/model.onnx --onnx \
+python demos/real_time.py \
+  --model utils/outputs/model.onnx --onnx \
   --ref zzj=zzj.wav \
   --ref zzx=zzx.wav \
+  。。。
   --threshold 0.55
 """

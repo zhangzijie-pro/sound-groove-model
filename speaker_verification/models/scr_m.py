@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from wrr_mixer import HybridEPA_WRR_Block
+from reat import REAT_DiarizationHead
 
 
 class Res2Conv1dReluBn(nn.Module):
@@ -78,43 +80,40 @@ class AttentiveStatsPool(nn.Module):
         return torch.cat([mean, std], dim=1)
 
 
-class ECAPA_TDNN(nn.Module):
+class SCR_M(nn.Module):
     def __init__(self, in_channels=80, channels=512, embd_dim=192):
         super().__init__()
         self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)
         self.layer2 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=2, dilation=2, scale=8)
-        self.layer3 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=3, dilation=3, scale=8)
-        # self.layer4 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=4, dilation=4, scale=8)
+        
+        self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
+        self.layer4 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
 
-        self.conv = nn.Conv1d(channels * 2, 1536, kernel_size=1)    # across layer2 and layer3 ,if you want to add layer4, change to channels * 3
+        self.conv = nn.Conv1d(channels * 2, 1536, kernel_size=1)
         self.pooling = AttentiveStatsPool(1536, 128)
         self.bn1 = nn.BatchNorm1d(3072)
         self.linear = nn.Linear(3072, embd_dim)
         self.bn2 = nn.BatchNorm1d(embd_dim)
+        
+        self.diar_head = REAT_DiarizationHead(num_speakers_max=10, dim=512)
 
-    def forward(self, x):
-        # x: [B, T, 80]
-        x = x.transpose(1, 2)  # -> [B, 80, T]
+    def forward(self, x, return_diarization=False):
+        x = x.transpose(1, 2)                    # [B, 80, T]
         out1 = self.layer1(x)
         out2 = self.layer2(out1)
         out3 = self.layer3(out1 + out2)
+        out4 = self.layer4(out3) 
 
-        # Choice 1: Don't use layer4, just concat out2 and out3
-        
-        # out4 = self.layer4(out1 + out2 + out3)
-        
-        # Choice 2: Don't use Residual
-
-        # out3 = self.layer3(out2)
-        # out4 = self.layer4(out3)
-
-        # out = torch.cat([out2, out3, out4], dim=1)  # [B, 2048, T]
-        out = torch.cat([out2, out3], dim=1)  # [B, 1536, T]
+        out = torch.cat([out2, out3], dim=1)     # [B, 1024, T]
         out = F.relu(self.conv(out))
-        # out = F.gelu(self.conv(out))
+        pooled = self.pooling(out)
+        emb = self.bn1(pooled)
+        emb = self.bn2(self.linear(emb))
+        emb = F.normalize(emb, p=2, dim=1)       # [B, 192]
 
-        out = self.bn1(self.pooling(out))           # [B, 3072]
-        out = self.bn2(self.linear(out))            # [B, 192]
-
-        out = F.normalize(out, p=2, dim=1)
-        return out
+        if return_diarization:
+            frame_feat = out4.transpose(1, 2)
+            speaker_ids, activity, speaker_count = self.diar_head(frame_feat)
+            return emb, speaker_ids, activity, speaker_count
+        
+        return emb

@@ -6,5 +6,5 @@ matplotlib
 tqdm
 hydra-core
 wandb
-gradio
 onnxruntime
+PyWavelets
