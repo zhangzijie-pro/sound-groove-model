@@ -16,18 +16,7 @@
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
 
-> A practical speaker verification system based on **ECAPA-TDNN + AAM-Softmax**, trained and evaluated on **CN-Celeb**.
-
----
-
-## ✨ Features
-
-- **SOTA Backbone**: ECAPA-TDNN (Res2Net + SE + Attentive Statistics Pooling)
-- **Strong Discriminative Loss**: AAM-Softmax with angular margin
-- **Balanced Sampling**: PK Batch Sampler (speaker-balanced)
-- **Robust Evaluation**: EER, score distribution, t-SNE, Recall@K
-- **Stable Inference**: Multi-crop averaging for reliable embeddings
-- **Low Memory Design**: Optimized for ~6GB GPU (AMP + gradient clipping)
+<img src="./docs/imgs/model.jpg" alt="WALL·E" width="600"/>
 
 ---
 

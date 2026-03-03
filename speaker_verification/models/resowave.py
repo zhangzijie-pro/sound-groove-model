@@ -80,7 +80,7 @@ class AttentiveStatsPool(nn.Module):
         return torch.cat([mean, std], dim=1)
 
 
-class SCR_M(nn.Module):
+class ResoWave(nn.Module):
     def __init__(self, in_channels=80, channels=512, embd_dim=192):
         super().__init__()
         self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)

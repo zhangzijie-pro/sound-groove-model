@@ -16,18 +16,7 @@
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
 
-> 一个实用且高效的**中文说话人验证系统**，基于 **ECAPA-TDNN + AAM-Softmax**，在 **CN-Celeb** 数据集上训练与评估。
-
----
-
-## ✨ 核心特性
-
-- **SOTA 主干网络**：ECAPA-TDNN（Res2Net + SE + 注意力统计池化）
-- **强判别损失**：AAM-Softmax（带角度边距）
-- **均衡采样**：PK Batch Sampler（说话人均衡）
-- **完整评估体系**：EER、分数分布、t-SNE、Recall@K
-- **稳定推理**：多段裁剪平均（crop-average）
-- **低显存优化**：专为 ≈6GB GPU 设计（AMP + 梯度裁剪）
+<img src="./docs/imgs/model.jpg" alt="WALL·E" width="600"/>
 
 ---
 
