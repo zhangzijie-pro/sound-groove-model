@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from wrr_mixer import HybridEPA_WRR_Block
-from reat import REAT_DiarizationHead
+from head.reat import REAT_DiarizationHead
 
 
 class Res2Conv1dReluBn(nn.Module):
@@ -89,7 +89,7 @@ class ResoWave(nn.Module):
         self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
         self.layer4 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
 
-        self.conv = nn.Conv1d(channels * 2, 1536, kernel_size=1)
+        self.conv = nn.Conv1d(channels * 3, 1536, kernel_size=1)
         self.pooling = AttentiveStatsPool(1536, 128)
         self.bn1 = nn.BatchNorm1d(3072)
         self.linear = nn.Linear(3072, embd_dim)
@@ -102,9 +102,9 @@ class ResoWave(nn.Module):
         out1 = self.layer1(x)
         out2 = self.layer2(out1)
         out3 = self.layer3(out1 + out2)
-        out4 = self.layer4(out3) 
+        out4 = self.layer4(out1 + out2 + out3) 
 
-        out = torch.cat([out2, out3], dim=1)     # [B, 1024, T]
+        out = torch.cat([out2, out3, out4], dim=1)     # [B, 1024, T]
         out = F.relu(self.conv(out))
         pooled = self.pooling(out)
         emb = self.bn1(pooled)
@@ -117,3 +117,13 @@ class ResoWave(nn.Module):
             return emb, speaker_ids, activity, speaker_count
         
         return emb
+    
+if __name__ == "__main__":
+    model = ResoWave()
+    x = torch.randn(2, 100, 80)  # [B, 80, T]
+    emb, speaker_ids, activity, speaker_count = model(x, return_diarization=True)
+    print("Embedding shape:", emb.shape)  # [B, 192]
+    print("Speaker IDs shape:", speaker_ids.shape)  # [B, T]
+    print("Activity shape:", activity.shape)  # [B, T]
+    print("Speaker count shape:", speaker_count.shape)  # [B]
+    print("model parameters:", sum(p.numel() for p in model.parameters()))

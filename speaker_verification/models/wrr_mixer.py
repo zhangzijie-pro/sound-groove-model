@@ -4,20 +4,44 @@ import torch.nn.functional as F
 from wtconv import WTConv1d
 
 
-class SimpleHaarDWT(nn.Module):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DWT(nn.Module):
     def __init__(self, levels=3):
         super().__init__()
         self.levels = levels
+        self.sqrt2_inv = 1.0 / (2 ** 0.5)
+
+    def _haar_step(self, x):
+        orig_len = x.shape[-1]
         
+        if orig_len % 2 == 1:
+            x = F.pad(x, (0, 1), mode='reflect')
+
+        even = x[:, :, 0::2]
+        odd  = x[:, :, 1::2]
+
+        low  = (even + odd) * self.sqrt2_inv
+        high = (even - odd) * self.sqrt2_inv
+
+        return low, high
+
     def forward(self, x):
+        """
+        输入: x.shape = [batch, channels, time]
+        """
         subbands = []
+        current = x
+
         for _ in range(self.levels):
-            low  = (x[:, :, ::2] + x[:, :, 1::2]) * 0.7071
-            high = (x[:, :, ::2] - x[:, :, 1::2]) * 0.7071
+            low, high = self._haar_step(current)
             subbands.append(high)
-            x = low
-        subbands.append(x)
-        return subbands[::-1]
+            current = low
+
+        subbands.append(current)
+        return subbands[::-1]        # [最高频, ..., 最低频]
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model=512, max_len=10000):
@@ -37,7 +61,7 @@ class PositionalEncoding(nn.Module):
 class EPA_WRR_Mixer(nn.Module):
     def __init__(self, channels=512, wt_levels=3, heads=4):
         super().__init__()
-        self.dwt = SimpleHaarDWT(wt_levels)
+        self.dwt = DWT(wt_levels)
         
         self.energy_fc   = nn.Linear(1, 1)
         self.energy_gate = nn.Sigmoid()
@@ -45,7 +69,7 @@ class EPA_WRR_Mixer(nn.Module):
         self.phase_conv = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
         self.phase_proj = nn.Linear(channels, channels)
         
-        self.pos_encoding = PositionalEncoding(d_model=channels)
+        # self.pos_encoding = PositionalEncoding(d_model=channels)
         self.scale_routers = nn.ModuleList([
             nn.Linear(channels, 1) for _ in range(wt_levels + 1)
         ])
@@ -74,7 +98,7 @@ class EPA_WRR_Mixer(nn.Module):
         gate = gate.transpose(1, 2)                       # (B, 1, T)
         x = x * gate
         
-        x = self.pos_encoding(x)
+        # x = self.pos_encoding(x)
         
         phase_proxy = torch.tanh(self.phase_conv(x))
         phase_feat = self.phase_proj(phase_proxy.transpose(1, 2)).transpose(1, 2)  # (B, C, T)
