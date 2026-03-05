@@ -29,6 +29,7 @@ class AAMSoftmax(nn.Module):
 
     def forward(self, emb: torch.Tensor, label: torch.Tensor):
         # normalize class weights
+        emb = F.normalize(emb, dim=-1)
         W = F.normalize(self.weight, p=2, dim=1)  # [C,D]
         # cosine: [B,C]
         cosine = torch.matmul(emb, W.t()).clamp(-1.0, 1.0)
