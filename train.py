@@ -30,58 +30,98 @@ def validate(model, loader, device, max_batches=200):
     model.eval()
     eer_scores, eer_labels = [], []
     der_list = []
+    der_detail_sum = {"fa": 0.0, "miss": 0.0, "conf": 0.0, "gt_active": 0.0, "pred_active": 0.0}
+    der_n = 0
 
     pbar = tqdm(loader, desc="VALID", total=min(len(loader), max_batches))
-    for i, batch in enumerate(pbar):
-        if i >= max_batches:
+    for bi, batch in enumerate(pbar):
+        if bi >= max_batches:
             break
 
         fbank = batch["fbank"].to(device)
         spk_label = batch["spk_label"].to(device)
         target_ids = batch["target_ids"].to(device)
         target_act = batch["target_activity"].to(device)
+        valid_mask = batch["valid_mask"].to(device)
 
         emb, pred_ids, pred_act, pred_count = model(fbank, return_diarization=True)
 
-        # SV: cosine similarity (random pairs in batch)
-        for i1 in range(len(emb)):
-            for i2 in range(i1 + 1, len(emb)):
-                sc = torch.cosine_similarity(emb[i1], emb[i2], dim=0).item()
-                label = 1 if spk_label[i1] == spk_label[i2] else 0
+        # SV: batch 内随机配对
+        for i in range(len(emb)):
+            for j in range(i + 1, len(emb)):
+                sc = torch.cosine_similarity(emb[i], emb[j], dim=0).item()
+                label = 1 if spk_label[i] == spk_label[j] else 0
                 eer_scores.append(sc)
                 eer_labels.append(label)
 
-        der = diarization_error_rate(pred_ids, target_ids, pred_act, target_act)
+        der, info = diarization_error_rate(
+            pred_ids,
+            target_ids,
+            pred_act,
+            target_act,
+            valid_mask=valid_mask,
+            return_detail=True,
+        )
         der_list.append(der.item())
 
-        pbar.set_postfix(DER=f"{np.mean(der_list) * 100:.2f}%")
+        for k in der_detail_sum:
+            der_detail_sum[k] += info[k]
+        der_n += 1
+
+        pbar.set_postfix(
+            DER=f"{np.mean(der_list) * 100:.2f}%",
+            FA=f"{info['fa']:.0f}",
+            MISS=f"{info['miss']:.0f}",
+            CONF=f"{info['conf']:.0f}",
+        )
 
     eer, _ = compute_eer(eer_labels, eer_scores)
     avg_der = np.mean(der_list) * 100 if len(der_list) else 100.0
+
+    if der_n > 0:
+        der_detail_avg = {k: v / der_n for k, v in der_detail_sum.items()}
+    else:
+        der_detail_avg = der_detail_sum
+
     pos = np.mean([s for s, l in zip(eer_scores, eer_labels) if l == 1]) if any(l == 1 for l in eer_labels) else 0.0
     neg = np.mean([s for s, l in zip(eer_scores, eer_labels) if l == 0]) if any(l == 0 for l in eer_labels) else 0.0
-    return {"eer": eer, "der": avg_der, "pos_mean": pos, "neg_mean": neg}
 
+    return {
+        "eer": eer,
+        "der": avg_der,
+        "pos_mean": pos,
+        "neg_mean": neg,
+        "der_detail": der_detail_avg,
+    }
 
 def train_one_epoch(model, loss_fn, loader, device, optim, scaler, use_amp, grad_clip):
     model.train()
     loss_meter = AverageMeter()
-
     pbar = tqdm(loader, desc="TRAIN", ncols=120)
+
     for batch in pbar:
         fbank = batch["fbank"].to(device, non_blocking=True)
         spk_label = batch["spk_label"].to(device, non_blocking=True)
         target_ids = batch["target_ids"].to(device, non_blocking=True)
         target_act = batch["target_activity"].to(device, non_blocking=True)
         target_count = batch["target_count"].to(device, non_blocking=True)
+        valid_mask = batch["valid_mask"].to(device, non_blocking=True)
 
         optim.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             emb, pred_ids, pred_act, pred_count = model(fbank, return_diarization=True)
+
             loss = loss_fn(
-                emb, pred_ids, pred_act, pred_count,
-                spk_label, target_ids, target_act, target_count
+                emb,
+                pred_ids,
+                pred_act,
+                pred_count,
+                spk_label,
+                target_ids,
+                target_act,
+                target_count,
+                valid_mask=valid_mask,
             )
 
         if use_amp:
@@ -107,7 +147,6 @@ def main(cfg: DictConfig):
     set_seed(int(cfg.seed))
     os.makedirs(cfg.out_dir, exist_ok=True)
 
-    # 保存 config 快照
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     with open(os.path.join(cfg.out_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg_dict, f, ensure_ascii=False, indent=2)
@@ -115,12 +154,19 @@ def main(cfg: DictConfig):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Dataset
     train_dataset = StaticMixDataset(
         out_dir=cfg.data.out_dir,
         manifest=cfg.data.manifest,
         crop_sec=float(cfg.data.crop_sec),
         shuffle=True,
+    )
+
+    val_manifest = cfg.data.get("val_manifest", cfg.data.manifest)
+    val_dataset = StaticMixDataset(
+        out_dir=cfg.data.out_dir,
+        manifest=val_manifest,
+        crop_sec=float(cfg.data.crop_sec),
+        shuffle=False,
     )
 
     train_loader = DataLoader(
@@ -130,6 +176,15 @@ def main(cfg: DictConfig):
         shuffle=True,
         pin_memory=(device.type == "cuda"),
         drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=int(cfg.train.batch_size),
+        num_workers=int(cfg.train.num_workers),
+        shuffle=False,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
     )
 
     # Model
@@ -168,7 +223,7 @@ def main(cfg: DictConfig):
         )
         scheduler.step()
 
-        val_info = validate(model, train_loader, device, max_batches=int(cfg.train.val_batches))
+        val_info = validate(model, val_loader, device, max_batches=int(cfg.train.val_batches))
 
         history["train_loss"].append(train_loss)
         history["val_eer"].append(val_info["eer"])
@@ -176,7 +231,11 @@ def main(cfg: DictConfig):
 
         print(
             f"[Epoch {epoch}] Loss={train_loss:.4f} | "
-            f"SV-EER={val_info['eer'] * 100:.2f}% | DER={val_info['der']:.2f}%"
+            f"SV-EER={val_info['eer'] * 100:.2f}% | "
+            f"DER={val_info['der']:.2f}% | "
+            f"FA={val_info['der_detail']['fa']:.1f} "
+            f"MISS={val_info['der_detail']['miss']:.1f} "
+            f"CONF={val_info['der_detail']['conf']:.1f}"
         )
 
         ckpt = build_ckpt(
@@ -197,7 +256,6 @@ def main(cfg: DictConfig):
         if val_info["eer"] < best_eer:
             best_eer = val_info["eer"]
             save_ckpt(os.path.join(cfg.out_dir, "best.pt"), ckpt)
-            print(f"★★★ New best EER: {best_eer * 100:.2f}% ★★★")
 
         if _HAS_PLOT:
             try:
