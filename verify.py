@@ -1,351 +1,387 @@
-"""
-Speaker Verification Evaluation Script
-使用方式：
-    python verify.py --val_meta processed/cn_celeb2/val_meta.jsonl --ckpt outputs/best.pt
-"""
-
 import os
 import json
-import random
 import argparse
-from collections import defaultdict
 
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
-from utils.meters import compute_eer, roc_points, det_points, recall_at_k, _l2norm
-from utils.path_utils import _resolve_path
-from speaker_verification.models.ecapa import ECAPA_TDNN
-
-try:
-    from sklearn.manifold import TSNE
-    _HAS_SKLEARN = True
-except Exception:
-    _HAS_SKLEARN = False
+from speaker_verification.models.resowave import ResoWave
 
 
-def read_meta_jsonl(meta_path: str):
-    meta_path = os.path.abspath(meta_path)
-    base_dir = os.path.dirname(meta_path)
+def load_jsonl(path):
     items = []
-
-    with open(meta_path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            j = json.loads(line)
-            spk = str(j["spk"])
-            feat = _resolve_path(j["feat"], base_dir)
-            items.append((spk, feat))
+            if line:
+                items.append(json.loads(line))
     return items
 
 
-# =========================
-# Pair building
-# =========================
-def build_pairs(items, num_pos=3000, num_neg=3000, seed=1234):
-    random.seed(seed)
-    spk2paths = defaultdict(list)
-    for spk, p in items:
-        spk2paths[spk].append(p)
+class StaticMixEvalDataset(Dataset):
+    def __init__(self, root_dir, manifest_path):
+        self.root_dir = root_dir
+        self.items = load_jsonl(manifest_path)
 
-    spks_with2 = [s for s in spk2paths if len(spk2paths[s]) >= 2]
-    all_spks = list(spk2paths.keys())
+    def __len__(self):
+        return len(self.items)
 
-    if len(spks_with2) == 0:
-        raise RuntimeError("Not enough speakers to generate positive pairs.")
+    def __getitem__(self, idx):
+        meta = self.items[idx]
 
-    pairs = []
+        # 常见字段兜底
+        pt_path = meta.get("pt_path") or meta.get("feat_path") or meta.get("path")
+        if pt_path is None:
+            raise KeyError(f"manifest item missing pt_path/feat_path/path: {meta}")
 
-    # Positive pairs
-    for _ in range(num_pos):
-        spk = random.choice(spks_with2)
-        p1, p2 = random.sample(spk2paths[spk], 2)
-        pairs.append((1, p1, p2))
+        if not os.path.isabs(pt_path):
+            pt_path = os.path.join(self.root_dir, pt_path)
 
-    # Negative pairs
-    for _ in range(num_neg):
-        s1, s2 = random.sample(all_spks, 2)
-        p1 = random.choice(spk2paths[s1])
-        p2 = random.choice(spk2paths[s2])
-        pairs.append((0, p1, p2))
+        sample = torch.load(pt_path, map_location="cpu")
 
-    random.shuffle(pairs)
-    return pairs
+        feat = sample["feat"].float()                       # [T,80]
+        target_matrix = sample["target_matrix"].float()    # [T,K]
+        target_activity = sample["target_activity"].float()# [T]
+        target_count = torch.tensor(sample["target_count"]).long()
 
+        speakers = (
+            sample.get("speakers")
+            or sample.get("speaker_ids")
+            or meta.get("speakers")
+            or meta.get("speaker_ids")
+            or None
+        )
 
-# =========================
-# Embedding Extraction
-# =========================
-@torch.no_grad()
-def load_feat_pt(feat_path: str):
-    if not os.path.exists(feat_path):
-        return None
-    try:
-        feat = torch.load(feat_path, map_location="cpu", weights_only=True)
-    except:
-        feat = torch.load(feat_path, map_location="cpu")
-    if not torch.is_tensor(feat) or feat.dim() != 2:
-        return None
-    return feat
+        return {
+            "feat": feat,
+            "target_matrix": target_matrix,
+            "target_activity": target_activity,
+            "target_count": target_count,
+            "speakers": speakers,
+            "meta": meta,
+        }
 
 
-@torch.no_grad()
-def embed_from_feat(model, feat: torch.Tensor, device, crop_frames=400, num_crops=6, seed=1234):
-    rng = random.Random(seed)
-    T = feat.size(0)
+def collate_fn(batch):
+    B = len(batch)
+    T_max = max(x["feat"].size(0) for x in batch)
+    F_dim = batch[0]["feat"].size(1)
+    K = batch[0]["target_matrix"].size(1)
 
-    if T <= crop_frames:
-        x = feat.unsqueeze(0).to(device)
-        emb = model(x).squeeze(0).cpu()
-        return _l2norm(emb)
+    feats = torch.zeros(B, T_max, F_dim, dtype=torch.float32)
+    target_matrix = torch.zeros(B, T_max, K, dtype=torch.float32)
+    target_activity = torch.zeros(B, T_max, dtype=torch.float32)
+    target_count = torch.zeros(B, dtype=torch.long)
+    valid_mask = torch.zeros(B, T_max, dtype=torch.bool)
 
-    embs = []
-    for _ in range(num_crops):
-        s = rng.randint(0, T - crop_frames)
-        chunk = feat[s:s + crop_frames]
-        x = chunk.unsqueeze(0).to(device)
-        embs.append(model(x).squeeze(0).cpu())
+    speakers = []
+    metas = []
 
-    emb = torch.stack(embs, 0).mean(0)
-    return _l2norm(emb)
+    for i, x in enumerate(batch):
+        t = x["feat"].size(0)
+        feats[i, :t] = x["feat"]
+        target_matrix[i, :t] = x["target_matrix"]
+        target_activity[i, :t] = x["target_activity"]
+        target_count[i] = x["target_count"]
+        valid_mask[i, :t] = True
+        speakers.append(x["speakers"])
+        metas.append(x["meta"])
 
-
-@torch.no_grad()
-def embed_from_fbank_pt(model, feat_path: str, device, crop_frames=400, num_crops=6):
-    feat = load_feat_pt(feat_path)
-    if feat is None:
-        return None
-    return embed_from_feat(model, feat, device, crop_frames, num_crops)
-
-
-def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-    return float((a * b).sum().item())
-
-
-# =========================
-# t-SNE + Recall@K
-# =========================
-@torch.no_grad()
-def collect_embeddings_for_tsne(model, items, device, max_spk=20, per_spk=25,
-                                crop_frames=400, num_crops=6, seed=1234):
-    random.seed(seed)
-    spk2paths = defaultdict(list)
-    for spk, p in items:
-        spk2paths[spk].append(p)
-
-    spks = [s for s in spk2paths if len(spk2paths[s]) >= 2]
-    random.shuffle(spks)
-    spks = spks[:max_spk]
-
-    X_list, y_list = [], []
-    for spk in spks:
-        paths = random.sample(spk2paths[spk], min(per_spk, len(spk2paths[spk])))
-        for p in paths:
-            emb = embed_from_fbank_pt(model, p, device, crop_frames, num_crops)
-            if emb is not None:
-                X_list.append(emb.numpy())
-                y_list.append(spk)
-
-    if len(X_list) == 0:
-        return None, None
-
-    uniq = sorted(set(y_list))
-    spk2id = {s: i for i, s in enumerate(uniq)}
-    y = np.array([spk2id[s] for s in y_list], dtype=np.int64)
-
-    return np.stack(X_list), y
+    return {
+        "feat": feats,
+        "target_matrix": target_matrix,
+        "target_activity": target_activity,
+        "target_count": target_count,
+        "valid_mask": valid_mask,
+        "speakers": speakers,
+        "metas": metas,
+    }
 
 
-# =========================
-# Main Function
-# =========================
-def main(args):
-    os.makedirs(args.out_dir, exist_ok=True)
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+def cosine_sim(a, b):
+    a = F.normalize(a, p=2, dim=-1)
+    b = F.normalize(b, p=2, dim=-1)
+    return torch.matmul(a, b.transpose(-1, -2))
 
-    print("=" * 70)
-    print("Speaker Verification Evaluation")
-    print("=" * 70)
-    print(f"VAL_META   : {args.val_meta}")
-    print(f"CHECKPOINT : {args.ckpt}")
-    print(f"OUTPUT DIR : {args.out_dir}")
-    print(f"Crop Frames: {args.crop_frames} | Num Crops: {args.num_crops}")
-    print(f"Pairs      : {args.num_pos} pos + {args.num_neg} neg")
-    print(f"Device     : {args.device}")
-    print("=" * 70)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
-    # 1. Load meta
-    items = read_meta_jsonl(args.val_meta)
-    print(f"Loaded {len(items)} utterances from {len(set(spk for spk, _ in items))} speakers\n")
-
-    # 2. Build pairs
-    pairs = build_pairs(items, num_pos=args.num_pos, num_neg=args.num_neg, seed=args.seed)
-    print(f"Generated {len(pairs)} pairs\n")
-
-    # 3. Load model
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    model = ECAPA_TDNN(
+def load_model(ckpt_path, device, channels=512, embd_dim=192, max_mix_speakers=5):
+    model = ResoWave(
         in_channels=80,
-        channels=args.channels,
-        embd_dim=args.emb_dim
+        channels=channels,
+        embd_dim=embd_dim,
+        max_mix_speakers=max_mix_speakers,
     ).to(device)
 
-    model.load_state_dict(ckpt["model"], strict=True)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state = ckpt.get("model") or ckpt.get("state_dict") or ckpt
+    model.load_state_dict(state, strict=False)
     model.eval()
-    print(f"Model loaded: ECAPA-TDNN (channels={args.channels}, emb_dim={args.emb_dim})\n")
+    return model
 
-    # 4. Scoring
-    emb_cache = {}
-    labels, scores = [], []
-    missing = 0
 
-    for is_same, p1, p2 in tqdm(pairs, desc="Scoring"):
-        if p1 not in emb_cache:
-            emb_cache[p1] = embed_from_fbank_pt(model, p1, device, args.crop_frames, args.num_crops)
-        if p2 not in emb_cache:
-            emb_cache[p2] = embed_from_fbank_pt(model, p2, device, args.crop_frames, args.num_crops)
+def load_speaker_bank(bank_path, device):
+    """
+    bank 格式建议：
+    {
+        "names": ["zhangsan", "lisi", ...],
+        "embeddings": tensor/list, shape [N,D]
+    }
+    """
+    if bank_path is None:
+        return None
 
-        e1 = emb_cache[p1]
-        e2 = emb_cache[p2]
+    bank = torch.load(bank_path, map_location=device)
+    names = bank["names"]
+    embs = torch.as_tensor(bank["embeddings"], dtype=torch.float32, device=device)
+    embs = F.normalize(embs, p=2, dim=-1)
+    return {"names": names, "embeddings": embs}
 
-        if e1 is None or e2 is None:
-            missing += 1
+
+def decode_predictions(slot_logits, activity_logits, count_logits, valid_mask, activity_th=0.5):
+    """
+    返回：
+      pred_slot_id: [B,T] argmax 槽位
+      pred_active:  [B,T] bool
+      pred_count:   [B] 1..K
+    """
+    slot_id = slot_logits.argmax(dim=-1)  # [B,T]
+    act_prob = torch.sigmoid(activity_logits)
+    pred_active = act_prob >= activity_th
+
+    pred_count = count_logits.argmax(dim=-1) + 1  # [B]
+    pred_active = pred_active & valid_mask
+
+    return slot_id, pred_active, pred_count
+
+
+def build_slot_prototypes(frame_embeds, slot_id, pred_active, pred_count):
+    """
+    对每个样本构造预测槽位 prototype
+    返回 list[dict]:
+      [
+        {
+          "slot_ids": [...],
+          "prototypes": [S,D],
+          "durations": [S]
+        },
+        ...
+      ]
+    """
+    B, T, D = frame_embeds.shape
+    out = []
+
+    for b in range(B):
+        fb = frame_embeds[b]          # [T,D]
+        sb = slot_id[b]               # [T]
+        ab = pred_active[b]           # [T]
+        num_spk = int(pred_count[b].item())
+
+        slot_stats = []
+        for k in range(num_spk):
+            mask = (sb == k) & ab
+            dur = int(mask.sum().item())
+            if dur <= 0:
+                continue
+
+            proto = fb[mask].mean(dim=0)
+            proto = F.normalize(proto, p=2, dim=-1)
+            slot_stats.append((k, proto, dur))
+
+        if len(slot_stats) == 0:
+            out.append({"slot_ids": [], "prototypes": None, "durations": []})
+        else:
+            slot_ids = [x[0] for x in slot_stats]
+            protos = torch.stack([x[1] for x in slot_stats], dim=0)
+            durs = [x[2] for x in slot_stats]
+            out.append({"slot_ids": slot_ids, "prototypes": protos, "durations": durs})
+
+    return out
+
+
+def identify_slots(slot_pack, bank, sim_th=0.45):
+    if bank is None:
+        return None
+
+    results = []
+    names = bank["names"]
+    bank_embs = bank["embeddings"]
+
+    for item in slot_pack:
+        protos = item["prototypes"]
+        if protos is None or protos.numel() == 0:
+            results.append([])
             continue
 
-        scores.append(cosine_sim(e1, e2))
-        labels.append(is_same)
+        sims = cosine_sim(protos, bank_embs)   # [S,N]
+        vals, idxs = sims.max(dim=-1)
 
-    print(f"\nScoring completed! Used pairs: {len(scores)}, Skipped: {missing}")
+        sample_ret = []
+        for i in range(protos.size(0)):
+            name = names[idxs[i].item()] if vals[i].item() >= sim_th else "unknown"
+            sample_ret.append({
+                "slot": item["slot_ids"][i],
+                "name": name,
+                "score": float(vals[i].item()),
+                "duration_frames": int(item["durations"][i]),
+            })
+        results.append(sample_ret)
 
-    if len(scores) == 0:
-        print("[ERROR] No valid pairs! Check your feature paths.")
-        return
+    return results
 
-    # 5. EER & Metrics
-    eer, th = compute_eer(labels, scores)
-    print(f"\n>>> EER = {eer*100:.3f}%   (threshold ≈ {th:.4f})")
 
-    pos = [s for s, l in zip(scores, labels) if l == 1]
-    neg = [s for s, l in zip(scores, labels) if l == 0]
-    print(f"Pos mean: {np.mean(pos):.4f} | Neg mean: {np.mean(neg):.4f}")
+def compute_activity_f1(pred_active, target_activity, valid_mask):
+    pa = pred_active[valid_mask]
+    ta = target_activity.bool()[valid_mask]
 
-    # 6. Save Plots
-    fpr, tpr = roc_points(labels, scores, num_th=200)
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr)
-    plt.title(f"ROC Curve (EER = {eer*100:.2f}%)")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.grid(True)
-    plt.savefig(os.path.join(args.out_dir, "roc.png"), dpi=300)
-    plt.close()
+    tp = ((pa == 1) & (ta == 1)).sum().item()
+    fp = ((pa == 1) & (ta == 0)).sum().item()
+    fn = ((pa == 0) & (ta == 1)).sum().item()
 
-    fars, frrs = det_points(labels, scores, num_th=400)
-    plt.figure(figsize=(8, 6))
-    plt.plot(fars, frrs)
-    plt.title(f"DET Curve (EER = {eer*100:.2f}%)")
-    plt.xlabel("False Acceptance Rate")
-    plt.ylabel("False Rejection Rate")
-    plt.grid(True)
-    plt.savefig(os.path.join(args.out_dir, "det.png"), dpi=300)
-    plt.close()
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+    f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+    return prec, rec, f1
 
-    plt.figure(figsize=(9, 6))
-    plt.hist(pos, bins=80, alpha=0.7, label="Same Speaker")
-    plt.hist(neg, bins=80, alpha=0.7, label="Different Speaker")
-    plt.title("Score Distribution")
-    plt.xlabel("Cosine Similarity")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(args.out_dir, "score_hist.png"), dpi=300)
-    plt.close()
 
-    # 7. t-SNE + Recall@K
-    X, y_tsne = collect_embeddings_for_tsne(
-        model, items, device,
-        max_spk=20, per_spk=25,
-        crop_frames=args.crop_frames,
-        num_crops=args.num_crops,
-        seed=args.seed
+def compute_simple_slot_accuracy(slot_logits, target_matrix, valid_mask):
+    pred_slot = slot_logits.argmax(dim=-1)
+    gt_slot = target_matrix.argmax(dim=-1)
+
+    mask = valid_mask & (target_matrix.sum(dim=-1) > 0)
+    if mask.sum().item() == 0:
+        return 0.0
+
+    acc = (pred_slot[mask] == gt_slot[mask]).float().mean().item()
+    return acc
+
+
+def compute_dominant_speaker(slot_identity_result):
+    """
+    根据 duration_frames 最大者作为主说话人
+    """
+    if slot_identity_result is None or len(slot_identity_result) == 0:
+        return None
+
+    best = max(slot_identity_result, key=lambda x: x["duration_frames"])
+    return best["name"]
+
+
+@torch.no_grad()
+def verify(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    model = load_model(
+        args.ckpt,
+        device=device,
+        channels=args.channels,
+        embd_dim=args.embd_dim,
+        max_mix_speakers=args.max_mix_speakers,
+    )
+    bank = load_speaker_bank(args.speaker_bank, device=device)
+
+    dataset = StaticMixEvalDataset(args.data_root, args.manifest)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
     )
 
-    if X is not None and _HAS_SKLEARN:
-        tsne = TSNE(n_components=2, perplexity=30, random_state=args.seed, init="pca")
-        Z = tsne.fit_transform(X)
+    total_count_correct = 0
+    total_count_num = 0
 
-        plt.figure(figsize=(10, 8))
-        for spk_id in np.unique(y_tsne):
-            mask = (y_tsne == spk_id)
-            plt.scatter(Z[mask, 0], Z[mask, 1], s=12, alpha=0.8)
-        plt.title("t-SNE Visualization of Speaker Embeddings")
-        plt.grid(True)
-        plt.savefig(os.path.join(args.out_dir, "tsne.png"), dpi=300)
-        plt.close()
+    slot_acc_sum = 0.0
+    slot_acc_n = 0
 
-        # Recall@K
-        emb_t = torch.from_numpy(X).float()
-        emb_t = emb_t / (emb_t.norm(dim=1, keepdim=True) + 1e-12)
-        lab_t = torch.from_numpy(y_tsne).long()
-        recall = recall_at_k(emb_t, lab_t, ks=(1, 5, 10))
+    act_p_sum = 0.0
+    act_r_sum = 0.0
+    act_f1_sum = 0.0
+    act_n = 0
 
-        print("\nRecall@K (sampled):")
-        for k, v in recall.items():
-            print(f"  R@{k}: {v*100:.2f}%")
+    examples = []
 
-        with open(os.path.join(args.out_dir, "metrics.txt"), "w") as f:
-            f.write(f"EER: {eer*100:.3f}%\n")
-            f.write(f"Threshold: {th:.4f}\n")
-            for k, v in recall.items():
-                f.write(f"Recall@{k}: {v*100:.2f}%\n")
+    for batch in loader:
+        feat = batch["feat"].to(device)
+        target_matrix = batch["target_matrix"].to(device)
+        target_activity = batch["target_activity"].to(device)
+        target_count = batch["target_count"].to(device)
+        valid_mask = batch["valid_mask"].to(device)
 
-    print(f"\n所有结果已保存至: {args.out_dir}")
-    print("文件: roc.png, det.png, score_hist.png, tsne.png, metrics.txt")
+        emb, frame_embeds, slot_logits, activity_logits, count_logits = model(feat, return_diarization=True)
+
+        pred_slot_id, pred_active, pred_count = decode_predictions(
+            slot_logits, activity_logits, count_logits, valid_mask, activity_th=args.activity_th
+        )
+
+        # count acc
+        gt_count = target_count
+        total_count_correct += (pred_count == gt_count).sum().item()
+        total_count_num += gt_count.numel()
+
+        # activity
+        p, r, f1 = compute_activity_f1(pred_active, target_activity, valid_mask)
+        act_p_sum += p
+        act_r_sum += r
+        act_f1_sum += f1
+        act_n += 1
+
+        # 简单 slot acc
+        sacc = compute_simple_slot_accuracy(slot_logits, target_matrix, valid_mask)
+        slot_acc_sum += sacc
+        slot_acc_n += 1
+
+        # identity + dominant
+        slot_pack = build_slot_prototypes(frame_embeds, pred_slot_id, pred_active, pred_count)
+        identity_results = identify_slots(slot_pack, bank, sim_th=args.sim_th)
+
+        for i in range(min(len(identity_results) if identity_results is not None else 0, args.show_examples)):
+            dom = compute_dominant_speaker(identity_results[i])
+            examples.append({
+                "pred_count": int(pred_count[i].item()),
+                "identified": identity_results[i],
+                "dominant_speaker": dom,
+                "meta": batch["metas"][i],
+            })
+
+    print("=" * 100)
+    print("Verification Summary")
+    print(f"Count Accuracy        : {total_count_correct / max(total_count_num, 1):.4f}")
+    print(f"Activity Precision    : {act_p_sum / max(act_n, 1):.4f}")
+    print(f"Activity Recall       : {act_r_sum / max(act_n, 1):.4f}")
+    print(f"Activity F1           : {act_f1_sum / max(act_n, 1):.4f}")
+    print(f"Simple Slot Accuracy  : {slot_acc_sum / max(slot_acc_n, 1):.4f}")
+    print("=" * 100)
+
+    if len(examples) > 0:
+        print("Examples:")
+        for i, ex in enumerate(examples[:args.show_examples]):
+            print(f"[Example {i}] pred_count={ex['pred_count']}, dominant={ex['dominant_speaker']}")
+            print(f"  identified={ex['identified']}")
+            print(f"  meta={ex['meta']}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--manifest", type=str, required=True)
+
+    parser.add_argument("--speaker_bank", type=str, default=None)
+    parser.add_argument("--sim_th", type=float, default=0.45)
+    parser.add_argument("--activity_th", type=float, default=0.5)
+
+    parser.add_argument("--channels", type=int, default=512)
+    parser.add_argument("--embd_dim", type=int, default=192)
+    parser.add_argument("--max_mix_speakers", type=int, default=5)
+
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--show_examples", type=int, default=5)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Speaker Verification Evaluation Tool")
-
-    parser.add_argument("--val_meta", type=str, required=True,
-                        help="Path to validation meta.jsonl file")
-
-    parser.add_argument("--ckpt", type=str, required=True,
-                        help="Path to model checkpoint (.pt)")
-
-    parser.add_argument("--out_dir", type=str, default="outputs_eval",
-                        help="Directory to save evaluation results (default: outputs_eval)")
-
-    parser.add_argument("--crop_frames", type=int, default=400,
-                        help="Number of frames per crop (default: 400 ≈ 4秒)")
-
-    parser.add_argument("--num_crops", type=int, default=6,
-                        help="Number of crops to average (default: 6)")
-
-    parser.add_argument("--num_pos", type=int, default=3000,
-                        help="Number of positive pairs")
-
-    parser.add_argument("--num_neg", type=int, default=3000,
-                        help="Number of negative pairs")
-
-    parser.add_argument("--emb_dim", type=int, default=256,
-                        help="Embedding dimension (must match checkpoint)")
-
-    parser.add_argument("--channels", type=int, default=512,
-                        help="ECAPA channels (default: 512)")
-
-    parser.add_argument("--seed", type=int, default=1234,
-                        help="Random seed")
-
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
-                        help="Device to use")
-
-    args = parser.parse_args()
-
-    main(args)
+    args = parse_args()
+    verify(args)

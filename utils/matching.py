@@ -5,14 +5,6 @@ from scipy.optimize import linear_sum_assignment
 
 @torch.no_grad()
 def hungarian_match_logits(slot_logits, target_matrix, valid_mask=None):
-    """
-    slot_logits:   [B,T,K]
-    target_matrix: [B,T,K]
-    valid_mask:    [B,T]
-
-    return:
-      reordered_pred: [B,T,K]  # 按最佳匹配重排后的预测二值结果
-    """
     B, T, K = slot_logits.shape
     device = slot_logits.device
 

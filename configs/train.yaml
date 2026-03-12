@@ -15,10 +15,10 @@ model:
   max_mix_speakers: 4
 
 loss:
-  lambda_ver: 0.0 # 0.1
   lambda_pit: 1.0
   lambda_act: 1.0
   lambda_cnt: 0.2
+  lambda_frm: 0.5
   pos_weight: 2.0
   pit_pos_weight: 1.5
 
@@ -31,3 +31,4 @@ train:
   grad_clip: 5.0
   amp: true
   val_batches: 100
+  activity_threshold: 0.5

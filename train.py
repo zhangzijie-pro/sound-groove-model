@@ -3,7 +3,6 @@ import json
 import logging
 from datetime import datetime
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -17,7 +16,7 @@ from speaker_verification.checkpointing import ModelCfg, build_ckpt, save_ckpt
 
 from dataset.staticdataset import StaticMixDataset
 from utils.seed import set_seed
-from utils.meters import AverageMeter, compute_eer, diarization_error_rate_pit
+from utils.meters import AverageMeter, diarization_error_rate_pit, compute_count_acc, compute_activity_metrics
 
 try:
     from utils.plot import plot_curves
@@ -27,9 +26,6 @@ except Exception:
 
 
 def setup_logger(out_dir: str, logger_name: str = "train_logger"):
-    """
-    创建同时输出到控制台和文件的 logger
-    """
     os.makedirs(out_dir, exist_ok=True)
 
     logger = logging.getLogger(logger_name)
@@ -47,12 +43,10 @@ def setup_logger(out_dir: str, logger_name: str = "train_logger"):
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # 文件输出：保存全部 DEBUG 级别信息
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
-    # 控制台输出：INFO 及以上
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
@@ -65,33 +59,60 @@ def setup_logger(out_dir: str, logger_name: str = "train_logger"):
 
 
 @torch.no_grad()
-def validate(model, loader, device, max_batches=200):
+def validate(model, loss_fn, loader, device, max_batches=200, activity_threshold=0.5):
     model.eval()
-    eer_scores, eer_labels = [], []
+
+    val_loss_meter = AverageMeter()
+    pit_meter = AverageMeter()
+    act_meter = AverageMeter()
+    cnt_meter = AverageMeter()
+    frm_meter = AverageMeter()
+
     der_list = []
     der_detail_sum = {"fa": 0.0, "miss": 0.0, "conf": 0.0, "gt_active": 0.0, "pred_active": 0.0}
     der_n = 0
 
-    pbar = tqdm(loader, desc="VALID", total=min(len(loader), max_batches))
+    count_acc_sum = 0.0
+    count_acc_n = 0
+
+    act_prec_sum = 0.0
+    act_rec_sum = 0.0
+    act_f1_sum = 0.0
+    act_n = 0
+
+    pbar = tqdm(loader, desc="VALID", total=min(len(loader), max_batches), ncols=120)
+
     for bi, batch in enumerate(pbar):
         if bi >= max_batches:
             break
 
-        fbank = batch["fbank"].to(device)
-        spk_label = batch["spk_label"].to(device)
-        target_matrix = batch["target_matrix"].to(device)
-        target_act = batch["target_activity"].to(device)
-        valid_mask = batch["valid_mask"].to(device)
+        fbank = batch["fbank"].to(device, non_blocking=True)
+        target_matrix = batch["target_matrix"].to(device, non_blocking=True)
+        target_act = batch["target_activity"].to(device, non_blocking=True)
+        target_count = batch["target_count"].to(device, non_blocking=True)
+        valid_mask = batch["valid_mask"].to(device, non_blocking=True)
 
-        emb, frame_embeds, slot_logits, pred_act, pred_count = model(fbank, return_diarization=True)
+        _, frame_embeds, slot_logits, pred_act, pred_count = model(fbank, return_diarization=True)
 
-        # SV EER
-        for i in range(len(emb)):
-            for j in range(i + 1, len(emb)):
-                sc = torch.cosine_similarity(emb[i], emb[j], dim=0).item()
-                label = 1 if spk_label[i] == spk_label[j] else 0
-                eer_scores.append(sc)
-                eer_labels.append(label)
+        loss_dict = loss_fn(
+            frame_embeds=frame_embeds,
+            slot_logits=slot_logits,
+            pred_activity=pred_act,
+            pred_count=pred_count,
+            target_matrix=target_matrix,
+            target_activity=target_act,
+            target_count=target_count,
+            valid_mask=valid_mask,
+            return_detail=True,
+        )
+        loss = loss_dict["total"]
+
+        bs = fbank.size(0)
+        val_loss_meter.update(float(loss.item()), bs)
+        pit_meter.update(float(loss_dict["pit_loss"].item()), bs)
+        act_meter.update(float(loss_dict["act_loss"].item()), bs)
+        cnt_meter.update(float(loss_dict["cnt_loss"].item()), bs)
+        frm_meter.update(float(loss_dict["frm_loss"].item()), bs)
 
         der, info = diarization_error_rate_pit(
             slot_logits,
@@ -100,38 +121,60 @@ def validate(model, loader, device, max_batches=200):
             valid_mask=valid_mask,
             return_detail=True,
         )
-        der_list.append(der.item())
+        der_list.append(float(der.item()))
 
         for k in der_detail_sum:
-            der_detail_sum[k] += info[k]
+            der_detail_sum[k] += float(info[k])
         der_n += 1
 
+        cacc = compute_count_acc(pred_count, target_count)
+        count_acc_sum += cacc
+        count_acc_n += 1
+
+        ap, ar, af1 = compute_activity_metrics(pred_act, target_act, valid_mask, threshold=activity_threshold)
+        act_prec_sum += ap
+        act_rec_sum += ar
+        act_f1_sum += af1
+        act_n += 1
+
         pbar.set_postfix(
-            DER=f"{sum(der_list)/len(der_list)*100:.2f}%",
-            FA=f"{info['fa']:.0f}",
-            MISS=f"{info['miss']:.0f}",
-            CONF=f"{info['conf']:.0f}",
+            loss=f"{val_loss_meter.avg:.4f}",
+            DER=f"{(sum(der_list)/max(len(der_list),1))*100:.2f}%",
+            CAcc=f"{(count_acc_sum/max(count_acc_n,1))*100:.1f}%",
+            ActF1=f"{(act_f1_sum/max(act_n,1))*100:.1f}%"
         )
 
-    eer, _ = compute_eer(eer_labels, eer_scores)
     avg_der = sum(der_list) / max(1, len(der_list)) * 100.0
-
     der_detail_avg = {k: v / max(1, der_n) for k, v in der_detail_sum.items()}
 
     return {
-        "eer": eer,
+        "val_loss": val_loss_meter.avg,
+        "pit_loss": pit_meter.avg,
+        "act_loss": act_meter.avg,
+        "cnt_loss": cnt_meter.avg,
+        "frm_loss": frm_meter.avg,
         "der": avg_der,
         "der_detail": der_detail_avg,
+        "count_acc": count_acc_sum / max(1, count_acc_n),
+        "act_prec": act_prec_sum / max(1, act_n),
+        "act_rec": act_rec_sum / max(1, act_n),
+        "act_f1": act_f1_sum / max(1, act_n),
     }
+
 
 def train_one_epoch(model, loss_fn, loader, device, optim, scaler, use_amp, grad_clip):
     model.train()
+
     loss_meter = AverageMeter()
+    pit_meter = AverageMeter()
+    act_meter = AverageMeter()
+    cnt_meter = AverageMeter()
+    frm_meter = AverageMeter()
+
     pbar = tqdm(loader, desc="TRAIN", ncols=120)
 
     for batch in pbar:
         fbank = batch["fbank"].to(device, non_blocking=True)
-        spk_label = batch["spk_label"].to(device, non_blocking=True)
         target_matrix = batch["target_matrix"].to(device, non_blocking=True)
         target_act = batch["target_activity"].to(device, non_blocking=True)
         target_count = batch["target_count"].to(device, non_blocking=True)
@@ -140,19 +183,20 @@ def train_one_epoch(model, loss_fn, loader, device, optim, scaler, use_amp, grad
         optim.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            emb, frame_embeds, slot_logits, pred_act, pred_count = model(fbank, return_diarization=True)
+            _, frame_embeds, slot_logits, pred_act, pred_count = model(fbank, return_diarization=True)
 
-            loss = loss_fn(
-                emb,
-                slot_logits,
-                pred_act,
-                pred_count,
-                spk_label,
-                target_matrix,
-                target_act,
-                target_count,
+            loss_dict = loss_fn(
+                frame_embeds=frame_embeds,
+                slot_logits=slot_logits,
+                pred_activity=pred_act,
+                pred_count=pred_count,
+                target_matrix=target_matrix,
+                target_activity=target_act,
+                target_count=target_count,
                 valid_mask=valid_mask,
+                return_detail=True,
             )
+            loss = loss_dict["total"]
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -167,9 +211,27 @@ def train_one_epoch(model, loss_fn, loader, device, optim, scaler, use_amp, grad
 
         bs = fbank.size(0)
         loss_meter.update(float(loss.item()), bs)
-        pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", LR=f"{optim.param_groups[0]['lr']:.2e}")
+        pit_meter.update(float(loss_dict["pit_loss"].item()), bs)
+        act_meter.update(float(loss_dict["act_loss"].item()), bs)
+        cnt_meter.update(float(loss_dict["cnt_loss"].item()), bs)
+        frm_meter.update(float(loss_dict["frm_loss"].item()), bs)
 
-    return loss_meter.avg
+        pbar.set_postfix(
+            loss=f"{loss_meter.avg:.4f}",
+            pit=f"{pit_meter.avg:.4f}",
+            act=f"{act_meter.avg:.4f}",
+            cnt=f"{cnt_meter.avg:.4f}",
+            frm=f"{frm_meter.avg:.4f}",
+            LR=f"{optim.param_groups[0]['lr']:.2e}",
+        )
+
+    return {
+        "loss": loss_meter.avg,
+        "pit_loss": pit_meter.avg,
+        "act_loss": act_meter.avg,
+        "cnt_loss": cnt_meter.avg,
+        "frm_loss": frm_meter.avg,
+    }
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="train")
@@ -196,7 +258,7 @@ def main(cfg: DictConfig):
         shuffle=True,
     )
     logger.info(
-        f"Train dataset loaded | num_classes={train_dataset.num_classes} | size={len(train_dataset)}"
+        f"Train dataset loaded | num_classes={getattr(train_dataset, 'num_classes', 'N/A')} | size={len(train_dataset)}"
     )
 
     val_dataset = StaticMixDataset(
@@ -233,14 +295,14 @@ def main(cfg: DictConfig):
     ).to(device)
     logger.info(f"Model initialized: {model.__class__.__name__}")
 
+    lambda_frm = float(getattr(cfg.loss, "lambda_frm", 0.5))
+
     loss_fn = MultiTaskLoss(
-        embedding_dim=int(cfg.model.emb_dim),
-        num_classes=int(train_dataset.num_classes),   # 这里只给 SV 分支用
         max_spk=int(cfg.model.max_mix_speakers),
-        lambda_ver=float(cfg.loss.lambda_ver),
         lambda_pit=float(cfg.loss.lambda_pit),
         lambda_act=float(cfg.loss.lambda_act),
         lambda_cnt=float(cfg.loss.lambda_cnt),
+        lambda_frm=lambda_frm,
         pos_weight=float(cfg.loss.pos_weight),
         pit_pos_weight=float(cfg.loss.pit_pos_weight),
     ).to(device)
@@ -251,22 +313,39 @@ def main(cfg: DictConfig):
         lr=float(cfg.train.lr),
         weight_decay=float(cfg.train.weight_decay),
     )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, T_max=int(cfg.train.epochs)
+        optim,
+        T_max=int(cfg.train.epochs)
     )
 
     use_amp = bool(cfg.train.amp) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     logger.info(f"AMP enabled: {use_amp}")
 
-    history = {"train_loss": [], "val_eer": [], "val_der": []}
-    best_eer = 1e9
+    history = {
+        "train_loss": [],
+        "train_pit_loss": [],
+        "train_act_loss": [],
+        "train_cnt_loss": [],
+        "train_frm_loss": [],
+        "val_loss": [],
+        "val_pit_loss": [],
+        "val_act_loss": [],
+        "val_cnt_loss": [],
+        "val_frm_loss": [],
+        "val_der": [],
+        "val_count_acc": [],
+        "val_act_f1": [],
+    }
+
+    best_der = 1e9
 
     for epoch in range(1, int(cfg.train.epochs) + 1):
         logger.info("=" * 80)
         logger.info(f"Epoch {epoch}/{cfg.train.epochs} started")
 
-        train_loss = train_one_epoch(
+        train_info = train_one_epoch(
             model=model,
             loss_fn=loss_fn,
             loader=train_loader,
@@ -284,20 +363,39 @@ def main(cfg: DictConfig):
 
         val_info = validate(
             model=model,
+            loss_fn=loss_fn,
             loader=val_loader,
             device=device,
             max_batches=int(cfg.train.val_batches),
+            activity_threshold=float(getattr(cfg.train, "activity_threshold", 0.5)),
         )
 
-        history["train_loss"].append(train_loss)
-        history["val_eer"].append(val_info["eer"])
+        history["train_loss"].append(train_info["loss"])
+        history["train_pit_loss"].append(train_info["pit_loss"])
+        history["train_act_loss"].append(train_info["act_loss"])
+        history["train_cnt_loss"].append(train_info["cnt_loss"])
+        history["train_frm_loss"].append(train_info["frm_loss"])
+
+        history["val_loss"].append(val_info["val_loss"])
+        history["val_pit_loss"].append(val_info["pit_loss"])
+        history["val_act_loss"].append(val_info["act_loss"])
+        history["val_cnt_loss"].append(val_info["cnt_loss"])
+        history["val_frm_loss"].append(val_info["frm_loss"])
         history["val_der"].append(val_info["der"])
+        history["val_count_acc"].append(val_info["count_acc"])
+        history["val_act_f1"].append(val_info["act_f1"])
 
         logger.info(
             f"[Epoch {epoch}] "
-            f"Loss={train_loss:.4f} | "
-            f"SV-EER={val_info['eer'] * 100:.2f}% | "
+            f"TrainLoss={train_info['loss']:.4f} | "
+            f"Train(PIT/ACT/CNT/FRM)=({train_info['pit_loss']:.4f}/"
+            f"{train_info['act_loss']:.4f}/"
+            f"{train_info['cnt_loss']:.4f}/"
+            f"{train_info['frm_loss']:.4f}) | "
+            f"ValLoss={val_info['val_loss']:.4f} | "
             f"DER={val_info['der']:.2f}% | "
+            f"CountAcc={val_info['count_acc'] * 100:.2f}% | "
+            f"ActF1={val_info['act_f1'] * 100:.2f}% | "
             f"FA={val_info['der_detail']['fa']:.1f} | "
             f"MISS={val_info['der_detail']['miss']:.1f} | "
             f"CONF={val_info['der_detail']['conf']:.1f}"
@@ -308,7 +406,7 @@ def main(cfg: DictConfig):
             optim=optim,
             scheduler=scheduler,
             epoch=epoch,
-            best_eer=val_info["eer"],
+            best_eer=float(val_info["der"]),
             model_cfg=ModelCfg(
                 channels=int(cfg.model.channels),
                 emb_dim=int(cfg.model.emb_dim),
@@ -321,12 +419,12 @@ def main(cfg: DictConfig):
         save_ckpt(last_ckpt_path, ckpt)
         logger.info(f"[Epoch {epoch}] Saved checkpoint: {last_ckpt_path}")
 
-        if val_info["eer"] < best_eer:
-            best_eer = val_info["eer"]
+        if val_info["der"] < best_der:
+            best_der = val_info["der"]
             best_ckpt_path = os.path.join(cfg.out_dir, "best.pt")
             save_ckpt(best_ckpt_path, ckpt)
             logger.info(
-                f"[Epoch {epoch}] New best EER={best_eer * 100:.2f}% | Saved best checkpoint: {best_ckpt_path}"
+                f"[Epoch {epoch}] New best DER={best_der:.2f}% | Saved best checkpoint: {best_ckpt_path}"
             )
 
         if _HAS_PLOT:
@@ -342,7 +440,7 @@ def main(cfg: DictConfig):
         logger.info(f"[Epoch {epoch}] History saved: {history_path}")
 
     logger.info(
-        f"Training finished! Best EER: {best_eer * 100:.2f}% | Output: {cfg.out_dir} | Log: {log_file}"
+        f"Training finished! Best DER: {best_der:.2f}% | Output: {cfg.out_dir} | Log: {log_file}"
     )
 
 
