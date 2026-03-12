@@ -86,7 +86,6 @@ class ResoWave(nn.Module):
         in_channels=80,
         channels=512,
         embd_dim=192,
-        num_classes=1000,
         max_mix_speakers=5,
     ):
         super().__init__()
@@ -104,8 +103,7 @@ class ResoWave(nn.Module):
         self.diar_head = REAT_DiarizationHead(
             in_dim=channels,
             emb_dim=embd_dim,
-            num_classes=num_classes,
-            max_mix_speakers=max_mix_speakers,
+            num_speakers_max=max_mix_speakers,
         )
 
     def forward(self, x, return_diarization=False):
@@ -129,7 +127,7 @@ class ResoWave(nn.Module):
 
         if return_diarization:
             frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
-            frame_embeds, frame_logits, activity_logits, count_logits = self.diar_head(frame_feat)
-            return emb, frame_embeds, frame_logits, activity_logits, count_logits
+            frame_embeds, slot_logits, activity_logits, count_logits = self.diar_head(frame_feat)
+            return emb, frame_embeds, slot_logits, activity_logits, count_logits
 
         return emb

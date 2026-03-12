@@ -208,6 +208,6 @@ __marimo__/
 outputs/
 *.wav
 CN-Celeb_flac/
-
+outputs_static_pit/
 processed/cn_celeb2/
-processed/static_mix_celeb2/
+processed/static_mix_cnceleb2/

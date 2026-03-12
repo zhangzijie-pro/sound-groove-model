@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
 
 
 class AverageMeter:
@@ -56,7 +57,6 @@ def compute_eer(labels, scores):
     tp = 0
     fp = 0
 
-    # 阈值 > max(score) 时：全部判为 diff => FAR=0, FRR=1
     best_eer = 0.5
     best_th = float(scores_s[0] + 1e-6)
     best_diff = abs(0.0 - 1.0)
@@ -160,78 +160,38 @@ def recall_at_k(embeddings: torch.Tensor, labels: torch.Tensor, ks=(1, 5, 10)):
 def l2norm(x: torch.Tensor, eps=1e-12):
     return x / (x.norm(p=2, dim=-1, keepdim=True) + eps)
 
-def diarization_error_rate(
-    pred_ids: torch.Tensor,
-    target_ids: torch.Tensor,
-    pred_activity: torch.Tensor,
-    target_activity: torch.Tensor,
-    act_th: float = 0.5,
-    valid_mask: torch.Tensor = None,
-    return_detail: bool = False,
+@torch.no_grad()
+def diarization_error_rate_pit(
+    slot_logits,
+    target_matrix,
+    target_activity,
+    valid_mask=None,
+    return_detail=False,
 ):
     """
-    帧级 DER:
-      FA   = pred_active=1 & gt_active=0
-      MISS = pred_active=0 & gt_active=1
-      CONF = pred_active=1 & gt_active=1 & pred_id != gt_id
-
-    注意:
-      这个定义默认 target_ids 和 pred_ids 的类别语义一致。
-      若你的 target_ids 是“每条混合语音内部重新编号”的局部 ID，
-      那还需要再做 permutation matching。
+    slot_logits:   [B,T,K]
+    target_matrix: [B,T,K]
+    target_activity: [B,T]
     """
-    if target_ids.dim() == 1:
-        target_ids = target_ids.unsqueeze(0)
-        target_activity = target_activity.unsqueeze(0)
-        pred_activity = pred_activity.unsqueeze(0)
-        if pred_ids.dim() == 1:
-            pred_ids = pred_ids.unsqueeze(0)
+    from utils.matching import hungarian_match_logits
 
-    B, T = target_ids.shape
+    pred_bin = hungarian_match_logits(slot_logits, target_matrix, valid_mask=valid_mask)  # [B,T,K]
 
-    # ---------- decode pred ids ----------
-    if pred_ids.dim() == 3:
-        if pred_ids.size(1) == T:
-            pred_id = pred_ids.argmax(dim=-1)  # [B,T,K] -> [B,T]
-        elif pred_ids.size(2) == T:
-            pred_id = pred_ids.permute(0, 2, 1).contiguous().argmax(dim=-1)
-        else:
-            raise ValueError(f"pred_ids shape not compatible with T={T}: {tuple(pred_ids.shape)}")
-    elif pred_ids.dim() == 2:
-        pred_id = pred_ids
-    else:
-        raise ValueError(f"Unsupported pred_ids shape: {tuple(pred_ids.shape)}")
-
-    # ---------- logits -> prob ----------
-    def to_prob(x: torch.Tensor) -> torch.Tensor:
-        if not x.dtype.is_floating_point:
-            return x.float()
-        xmin = float(x.min().item())
-        xmax = float(x.max().item())
-        if 0.0 <= xmin and xmax <= 1.0:
-            return x
-        return torch.sigmoid(x)
-
-    pred_p = to_prob(pred_activity)
-    gt_p = to_prob(target_activity)
-
-    pred_act = pred_p >= act_th
-    gt_act = gt_p >= act_th
+    pred_activity = (pred_bin.sum(dim=-1) > 0).float()
+    gt_activity = (target_matrix.sum(dim=-1) > 0).float()
 
     if valid_mask is None:
-        valid_mask = torch.ones_like(gt_act, dtype=torch.bool)
+        valid_mask = torch.ones_like(gt_activity, dtype=torch.bool)
     else:
         valid_mask = valid_mask.bool()
 
-    pred_act = pred_act & valid_mask
-    gt_act = gt_act & valid_mask
+    fa = ((pred_activity == 1) & (gt_activity == 0) & valid_mask).sum().float()
+    miss = ((pred_activity == 0) & (gt_activity == 1) & valid_mask).sum().float()
 
-    fa = (pred_act & ~gt_act).sum().float()
-    miss = (~pred_act & gt_act).sum().float()
-    both = pred_act & gt_act
-    conf = (both & (pred_id != target_ids)).sum().float()
+    # 多标签逐槽位不一致也算 confusion
+    conf = (((pred_bin != target_matrix).float().sum(dim=-1) > 0) & (gt_activity == 1) & valid_mask).sum().float()
 
-    denom = gt_act.sum().float().clamp_min(1.0)
+    denom = (gt_activity == 1).float()[valid_mask].sum().clamp_min(1.0)
     der = (fa + miss + conf) / denom
 
     if return_detail:
@@ -240,7 +200,6 @@ def diarization_error_rate(
             "miss": float(miss.item()),
             "conf": float(conf.item()),
             "gt_active": float(denom.item()),
-            "pred_active": float(pred_act.sum().item()),
+            "pred_active": float(pred_activity[valid_mask].sum().item()),
         }
-
     return der

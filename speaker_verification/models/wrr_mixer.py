@@ -86,6 +86,7 @@ class EPA_WRR_Mixer(nn.Module):
             nn.Linear(channels, channels),
             nn.Sigmoid()
         )
+        self.drop = nn.Dropout(0.2)
         self.proj_out = nn.Conv1d(channels, channels, 1)
 
     def forward(self, x):
@@ -131,7 +132,8 @@ class EPA_WRR_Mixer(nn.Module):
         echo = self.echo_gate(global_echo).unsqueeze(-1)
         fused = fused + fused * echo
         
-        out = self.proj_out(fused)
+        drop_out = self.drop(fused)
+        out = self.proj_out(drop_out)
         if out.shape[2] < T:
             pad_right = T - out.shape[2]
             out = F.pad(out, (0, pad_right), mode='constant', value=0)
@@ -156,12 +158,15 @@ class HybridEPA_WRR_Block(nn.Module):
             nn.Conv1d(out_channels // 8, out_channels, 1),
             nn.Sigmoid()
         )
-        
+
+        self.drop = nn.Dropout(0.2)
+    
     def forward(self, x):
         x = self.wtconv(x)
         x = self.epa_wrr(x)
         
         se_weight = self.se(x.mean(-1, keepdim=True))   # (B, C, 1)
         x = x * se_weight
+        x = self.drop(x)
         
         return x

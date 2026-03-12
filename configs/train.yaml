@@ -1,6 +1,6 @@
 seed: 1234
 device: "cuda"
-out_dir: "outputs_static"
+out_dir: "outputs"
 
 data:
   out_dir: "processed/static_mix_cnceleb2"
@@ -15,19 +15,19 @@ model:
   max_mix_speakers: 4
 
 loss:
-  lambda_ver: 1.0
-  lambda_diar: 0.5
-  act_w: 1.0
-  id_w: 1.0
-  cnt_w: 0.2
+  lambda_ver: 0.0 # 0.1
+  lambda_pit: 1.0
+  lambda_act: 1.0
+  lambda_cnt: 0.2
   pos_weight: 2.0
+  pit_pos_weight: 1.5
 
 train:
-  epochs: 80
+  epochs: 100
   batch_size: 16
-  num_workers: 4
-  lr: 3e-4
-  weight_decay: 3e-5
+  num_workers: 0
+  lr: 3.0e-4
+  weight_decay: 3.0e-5
   grad_clip: 5.0
   amp: true
   val_batches: 100

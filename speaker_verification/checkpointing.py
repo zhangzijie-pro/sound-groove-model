@@ -17,12 +17,12 @@ class ModelCfg:
 def build_ckpt(
     *,
     model: torch.nn.Module,
-    head: Optional[torch.nn.Module],
+    # head: Optional[torch.nn.Module],
     optim: Optional[torch.optim.Optimizer],
     scheduler: Optional[Any],
     epoch: int,
     best_eer: float,
-    label_map: Optional[Dict[str, int]],
+    # label_map: Optional[Dict[str, int]],
     model_cfg: ModelCfg,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -30,10 +30,10 @@ def build_ckpt(
         "epoch": epoch,
         "best_eer": float(best_eer),
         "model_state": model.state_dict(),
-        "head_state": None if head is None else head.state_dict(),
+        # "head_state": None if head is None else head.state_dict(),
         "optim_state": None if optim is None else optim.state_dict(),
         "scheduler_state": None if scheduler is None else scheduler.state_dict(),
-        "label_map": label_map or {},
+        # "label_map": label_map or {},
         "model_cfg": asdict(model_cfg),
     }
     if extra:

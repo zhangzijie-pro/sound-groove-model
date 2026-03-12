@@ -7,19 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from utils.path_utils import _resolve_path
-
-
 class StaticMixDataset(Dataset):
-    """
-    每个 pt 内部保存:
-      fbank: [T,80]
-      spk_label: int
-      target_ids: [T]
-      target_activity: [T]
-      target_count: int
-    """
-
     def __init__(
         self,
         out_dir: str = "processed/static_mix_cnceleb2",
@@ -52,48 +40,48 @@ class StaticMixDataset(Dataset):
         if shuffle:
             random.shuffle(self.items)
 
-        self.crop_frames = int(float(crop_sec) * 100)  # 10ms hop
+        self.crop_frames = int(float(crop_sec) * 100)
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx) -> Dict[str, Any]:
         rel_pt = self.items[idx]
-        abs_pt = _resolve_path(rel_pt, self.out_dir)
-        pack = torch.load(abs_pt, map_location="cpu")
+        abs_pt = os.path.join(self.out_dir, rel_pt)
+        pack = torch.load(abs_pt, map_location="cpu", weights_only=False)
 
-        fbank = pack["fbank"].float()                   # [T,80]
-        target_ids = pack["target_ids"].long()         # [T]
-        activity = pack["target_activity"].float()     # [T]
+        fbank = pack["fbank"].float()                    # [T,80]
+        target_matrix = pack["target_matrix"].float()    # [T,K]
+        activity = pack["target_activity"].float()       # [T]
         spk_label = int(pack["spk_label"])
         target_count = int(pack["target_count"])
 
         T = fbank.size(0)
-        valid_len = min(T, self.crop_frames)
+        K = target_matrix.size(1)
 
+        # Ensure the crop/pad logic is correct
         if T > self.crop_frames:
             s = random.randint(0, T - self.crop_frames)
             fbank = fbank[s:s + self.crop_frames]
-            target_ids = target_ids[s:s + self.crop_frames]
+            target_matrix = target_matrix[s:s + self.crop_frames]
             activity = activity[s:s + self.crop_frames]
             valid_mask = torch.ones(self.crop_frames, dtype=torch.bool)
 
         elif T < self.crop_frames:
             pad = self.crop_frames - T
             fbank = F.pad(fbank, (0, 0, 0, pad))
-            target_ids = F.pad(target_ids, (0, pad), value=0)
+            target_matrix = F.pad(target_matrix, (0, 0, 0, pad))
             activity = F.pad(activity, (0, pad), value=0.0)
 
             valid_mask = torch.zeros(self.crop_frames, dtype=torch.bool)
             valid_mask[:T] = True
-
         else:
             valid_mask = torch.ones(self.crop_frames, dtype=torch.bool)
 
         return {
-            "fbank": fbank,  # [T,80]
+            "fbank": fbank,
             "spk_label": torch.tensor(spk_label, dtype=torch.long),
-            "target_ids": target_ids,
+            "target_matrix": target_matrix,              # [T,K]
             "target_activity": activity,
             "target_count": torch.tensor(target_count, dtype=torch.long),
             "valid_mask": valid_mask,
