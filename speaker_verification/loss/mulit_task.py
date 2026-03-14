@@ -73,6 +73,12 @@ class MultiTaskLoss(nn.Module):
         target_matrix,
         valid_mask=None,
     ):
+        """
+        bug unsupport(类内拉近 + 类间推远)
+        同一 speaker 的帧接近自己的 prototype
+
+        远离其他 speaker 的 prototype
+        """
         device = frame_embeds.device
         B, T, D = frame_embeds.shape
         K = target_matrix.size(-1)
@@ -112,7 +118,8 @@ class MultiTaskLoss(nn.Module):
             sim = torch.einsum("td,kd->tk", fb_valid, protos)
 
             # loss = 1 - cos
-            pos_loss = (1.0 - sim) * weights
+            # pos_loss = (1.0 - sim) * weights
+            pos_loss = ((1.0 - sim).clamp_min(0.0)) * weights
 
             pos_count = weights.sum()
             if pos_count > 0:

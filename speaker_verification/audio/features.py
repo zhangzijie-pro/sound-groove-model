@@ -19,7 +19,7 @@ def load_wav_mono(path: str, target_sr: int = TARGET_SR) -> torch.Tensor:
 
     abs_w = wav.abs()
     if abs_w.numel() > 0:
-        thr = max(1e-4, float(abs_w.max()) * 0.02)  # 动态阈值：max 的 2%
+        thr = max(1e-4, float(abs_w.max()) * 0.02)
         idx = torch.nonzero(abs_w > thr, as_tuple=False).squeeze(-1)
         if idx.numel() > 0:
             wav = wav[idx[0].item() : idx[-1].item() + 1]

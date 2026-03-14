@@ -15,7 +15,7 @@ project_root = os.path.dirname(current_dir)
 
 sys.path.append(project_root)
 
-from speaker_verification.models.ecapa import ECAPA_TDNN
+from speaker_verification.models.resowave import ResoWave
 
 
 class Config:
@@ -66,22 +66,16 @@ class ModelExporter:
 
         print(f"[{self.__class__.__name__}] Device: {self.device}")
 
-    def split_checkpoint(self, save_head: bool = True):
-        """拆分 best.pt → model.pt + head.pt"""
+    def split_checkpoint(self):
+        """拆分 best.pt → model.pt"""
         print("正在拆分 checkpoint...")
         ckpt = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
 
-        model_state = ckpt["model"]
-        head_state = ckpt.get("head", None)
+        model_state = ckpt["model_state"]
 
         model_path = self.out_dir / "model.pt"
         torch.save(model_state, model_path)
         print(f"✓ model saved → {model_path}")
-
-        if save_head and head_state is not None:
-            head_path = self.out_dir / "head.pt"
-            torch.save(head_state, head_path)
-            print(f"✓ head saved → {head_path}")
 
         meta = {
             "emb_dim": self.emb_dim,
@@ -93,11 +87,11 @@ class ModelExporter:
             json.dump(meta, f, indent=2, ensure_ascii=False)
 
     def load_model(self):
-        print("加载 ECAPA-TDNN...")
-        self.model = ECAPA_TDNN(
+        print("加载 ResoWave...")
+        self.model = ResoWave(
             in_channels=80,
             channels=self.channels,
-            embd_dim=self.emb_dim
+            embd_dim=self.emb_dim,
         ).to(self.device)
 
         state_dict = torch.load(self.out_dir / "model.pt", map_location="cpu")
@@ -185,8 +179,6 @@ def main():
     args = parser.parse_args()
 
     exporter = ModelExporter(ckpt_path=args.ckpt, out_dir=args.out_dir)
-
-    start_time = time.time()
 
     if args.split:
         exporter.split_checkpoint()

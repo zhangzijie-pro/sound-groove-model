@@ -17,40 +17,29 @@ except Exception:
 
 @dataclass
 class StaticMixPrepCfg:
-    # preprocess_cnceleb2_train.py 的输出目录
     processed_dir: str = "../processed/cn_celeb2"
-
-    # 静态混合输出目录
     out_dir: str = "../processed/static_mix_cnceleb2"
 
-    # 训练/验证各生成多少条
     num_train_mixes: int = 100_000
     num_val_mixes: int = 10_000
 
-    # 每条样本混合说话人数范围
     min_mix: int = 2
     max_mix: int = 4
 
-    # 每条样本时长（秒）
     crop_sec: float = 4.0
 
-    # 说话人增益范围（dB）
     spk_snr_min: float = -5.0
     spk_snr_max: float = 5.0
 
-    # 噪声设置（可选）
     noise_fbank_pt_dir: str = ""
     noise_prob: float = 0.3
     noise_snr_min: float = -10.0
     noise_snr_max: float = 0.0
 
-    # 是否允许重叠
     allow_overlap: bool = True
 
-    # 控制偏移范围，越大越分散，越小越重叠
     max_offset_ratio: float = 0.35
 
-    # 随机种子
     seed: int = 1234
 
 
@@ -217,7 +206,6 @@ def generate_one_mix(
     target_matrix = torch.zeros(crop_frames, cfg.max_mix, dtype=torch.float32)
     target_activity = torch.zeros(crop_frames, dtype=torch.float32)
 
-    # 用于 SV 分支，随机从当前混合说话人中选一个主标签
     sv_spk = random.choice(spks)
 
     for local_slot, spk in enumerate(spks):
@@ -240,11 +228,9 @@ def generate_one_mix(
         seg = feat[src_s0:src_s0 + length] * gain
         mixed[dst_s0:dst_s0 + length] += seg
 
-        # 多标签，多槽位
         target_matrix[dst_s0:dst_s0 + length, local_slot] = 1.0
         target_activity[dst_s0:dst_s0 + length] = 1.0
 
-    # 可选加噪
     if noise_pts and (random.random() < cfg.noise_prob):
         npt = random.choice(noise_pts)
         nfeat = crop_or_pad_feat(load_feat_any(npt), crop_frames)
@@ -330,7 +316,6 @@ def main():
 
     ensure_dir(cfg.out_dir)
 
-    # 复制一份统一 spk2id 到混合目录
     with open(os.path.join(cfg.out_dir, "spk2id.json"), "w", encoding="utf-8") as f:
         json.dump(spk2id, f, ensure_ascii=False, indent=2)
 
