@@ -188,14 +188,28 @@ class MultiTaskLoss(nn.Module):
             # log_prob = torch.log(pos / denom + 1e-8)
             # loss_per_frame = -log_prob.squeeze(-1) * has_pos.float()
 
-            log_denom = torch.logsumexp(sim, dim=1, keepdim=True)   # [Tv,1]
+            sim = torch.matmul(f, protos.T) / temperature
+            sim = sim.float()
 
-            neg_inf = torch.full_like(sim, -1e9)
+            pos_mask = weights > 0.5
+            has_pos = pos_mask.any(dim=1)
+            if not has_pos.any():
+                continue
+
+            log_denom = torch.logsumexp(sim, dim=1, keepdim=True)
+
+            min_val = torch.finfo(sim.dtype).min
+            neg_inf = torch.full_like(sim, min_val)
             pos_logits = torch.where(pos_mask, sim, neg_inf)
-            log_pos = torch.logsumexp(pos_logits, dim=1, keepdim=True)  # [Tv,1]
+            log_pos = torch.logsumexp(pos_logits, dim=1, keepdim=True)
 
             log_prob = log_pos - log_denom
-            loss_per_frame = -log_prob.squeeze(-1) * has_pos.float()
+            loss_per_frame = -log_prob.squeeze(-1)
+
+            loss_per_frame = loss_per_frame[has_pos]
+            if loss_per_frame.numel() > 0:
+                total_loss += loss_per_frame.sum()
+                total_count += loss_per_frame.numel()
 
             n_valid = has_pos.sum()
             if n_valid > 0:
