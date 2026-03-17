@@ -213,3 +213,5 @@ processed/cn_celeb2/
 processed/static_mix_cnceleb2/
 
 outputs3/
+eval_staticmix/
+scripts/dscore

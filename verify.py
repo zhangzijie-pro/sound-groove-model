@@ -89,7 +89,7 @@ def main():
     print("=" * 100)
     print("STRICT VERIFY RESULT")
     for k, v in result.items():
-        print(f"{k}: {v}")
+        print(f"{k}: {v:.2f}")
     print("=" * 100)
 
 
