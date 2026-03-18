@@ -89,9 +89,13 @@ def main():
     print("=" * 100)
     print("STRICT VERIFY RESULT")
     for k, v in result.items():
-        print(f"{k}: {v:.2f}")
+        print(f"{k}: {v}")
     print("=" * 100)
 
 
 if __name__ == "__main__":
     main()
+
+"""
+python verify.py --ckpt outputs3/best.pt --data_out_dir processed/static_mix_cnceleb2 --manifest val_manifest.jsonl
+"""

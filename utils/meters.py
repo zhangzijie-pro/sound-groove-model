@@ -1,5 +1,6 @@
 import torch
 
+
 class AverageMeter:
     def __init__(self):
         self.reset()
@@ -14,25 +15,65 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / max(1, self.count)
 
+
+class DERTracker:
+    """
+    全局累计 DER 统计器：
+    最终用全局 sum(fa/miss/conf) / sum(gt_active)
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.fa = 0.0
+        self.miss = 0.0
+        self.conf = 0.0
+        self.gt_active = 0.0
+        self.pred_active = 0.0
+
+    def update(self, info: dict):
+        self.fa += float(info.get("fa", 0.0))
+        self.miss += float(info.get("miss", 0.0))
+        self.conf += float(info.get("conf", 0.0))
+        self.gt_active += float(info.get("gt_active", 0.0))
+        self.pred_active += float(info.get("pred_active", 0.0))
+
+    def value(self):
+        denom = max(self.gt_active, 1e-8)
+        der = (self.fa + self.miss + self.conf) / denom
+        return der
+
+    def detail(self):
+        return {
+            "fa": self.fa,
+            "miss": self.miss,
+            "conf": self.conf,
+            "gt_active": self.gt_active,
+            "pred_active": self.pred_active,
+            "der": self.value(),
+        }
+
+
 @torch.no_grad()
 def diarization_error_rate_pit(
     slot_logits,
     target_matrix,
-    target_activity,
+    target_activity=None,
     valid_mask=None,
     return_detail=False,
 ):
     """
-    slot_logits:   [B,T,K]
-    target_matrix: [B,T,K]
-    target_activity: [B,T]
+    内部训练用帧级 PIT-DER，不等同于标准 RTTM dscore。
+    slot_logits:  [B, T, K]
+    target_matrix:[B, T, K]
     """
     from utils.matching import hungarian_match_logits
 
+    target_matrix = target_matrix.float()
     pred_bin = hungarian_match_logits(slot_logits, target_matrix, valid_mask=valid_mask)  # [B,T,K]
 
-    pred_activity = (pred_bin.sum(dim=-1) > 0).float()
-    gt_activity = (target_matrix.sum(dim=-1) > 0).float()
+    gt_activity = (target_matrix.sum(dim=-1) > 0)
+    pred_activity = (pred_bin.sum(dim=-1) > 0)
 
     if valid_mask is None:
         valid_mask = torch.ones_like(gt_activity, dtype=torch.bool)
@@ -42,20 +83,24 @@ def diarization_error_rate_pit(
     fa = ((pred_activity == 1) & (gt_activity == 0) & valid_mask).sum().float()
     miss = ((pred_activity == 0) & (gt_activity == 1) & valid_mask).sum().float()
 
-    conf = (((pred_bin != target_matrix).float().sum(dim=-1) > 0) & (gt_activity == 1) & valid_mask).sum().float()
+    frame_slot_mismatch = ((pred_bin != target_matrix).float().sum(dim=-1) > 0)
+    conf = (frame_slot_mismatch & gt_activity & valid_mask).sum().float()
 
-    denom = (gt_activity == 1).float()[valid_mask].sum().clamp_min(1.0)
-    der = (fa + miss + conf) / denom
+    gt_active = (gt_activity & valid_mask).sum().float()
+    pred_active = (pred_activity & valid_mask).sum().float()
+
+    der = (fa + miss + conf) / gt_active.clamp_min(1.0)
 
     if return_detail:
         return der, {
             "fa": float(fa.item()),
             "miss": float(miss.item()),
             "conf": float(conf.item()),
-            "gt_active": float(denom.item()),
-            "pred_active": float(pred_activity[valid_mask].sum().item()),
+            "gt_active": float(gt_active.item()),
+            "pred_active": float(pred_active.item()),
         }
     return der
+
 
 @torch.no_grad()
 def compute_activity_metrics(pred_act_logits, target_act, valid_mask, threshold=0.5):
@@ -77,10 +122,8 @@ def compute_activity_metrics(pred_act_logits, target_act, valid_mask, threshold=
 def compute_count_acc(pred_count_logits, target_count):
     pred = pred_count_logits.argmax(dim=1)  # [B], 0..K-1
     gt = target_count.long()
-
     if gt.numel() > 0 and gt.min().item() >= 1:
         gt = gt - 1
-
     gt = gt.clamp(0, pred_count_logits.size(1) - 1)
     acc = (pred == gt).float().mean().item()
     return acc

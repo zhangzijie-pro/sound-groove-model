@@ -17,7 +17,7 @@
 </div>
 
 <div align="center">
-  <a href="README.md">English</a> • 
+  <a href="Readme_ch.md">中文文档</a> • 
   <a href="https://github.com/zhangzijie-pro/Speaker-Verification">GitHub</a> • 
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>

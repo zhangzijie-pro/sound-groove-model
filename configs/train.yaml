@@ -1,34 +1,49 @@
-seed: 1234
-device: "cuda"
-out_dir: "outputs3"
-
-data:
-  out_dir: "processed/static_mix_cnceleb2"
-  train_manifest: "train_manifest.jsonl"
-  val_manifest: "val_manifest.jsonl"
-  crop_sec: 4.0
-
 model:
-  feat_dim: 80
+  in_channels: 80
   channels: 512
-  emb_dim: 192
+  embd_dim: 256
   max_mix_speakers: 4
 
 loss:
   lambda_pit: 1.0
   lambda_act: 1.0
   lambda_cnt: 0.2
-  lambda_frm: 5.0
+  lambda_frm: 0.15
   pos_weight: 2.0
   pit_pos_weight: 1.5
+  proto_eps: 1.0e-8
+  proto_temperature: 0.07
+
+data:
+  out_dir: "processed/static_mix_cnceleb2"
+  train_manifest: "processed/static_mix_cnceleb2/train_manifest.json"
+  val_manifest: "processed/static_mix_cnceleb2/val_manifest.json"
+  crop_sec: 4.0
 
 train:
-  epochs: 60
-  batch_size: 32
-  num_workers: 0
+  seed: 42
+  device: "cuda"
+  epochs: 100
+  batch_size: 16
+  num_workers: 2
   lr: 3.0e-4
-  weight_decay: 3.0e-5
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
   grad_clip: 5.0
-  amp: true
-  val_batches: 100
-  activity_threshold: 0.6
+  use_scheduler: true
+
+validate:
+  batch_size: 64
+  max_batches: -1
+  activity_threshold: 0.5
+
+output:
+  save_dir: "outputs_318"
+  monitor: "val_loss"
+  monitor_mode: "min"
+  plot_history: true
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
