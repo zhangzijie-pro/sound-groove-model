@@ -18,10 +18,6 @@
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
 
-<img src="./docs/imgs/model.jpg" alt="WALL·E" width="600"/>
-
----
-
 ## 项目简介
 
 本仓库最初主要用于 **说话人验证 / 声纹识别** 方向的实验，现在正在向更实用的 **说话人感知多说话人分析系统** 演进。
@@ -456,7 +452,7 @@ class SpeakerBankBase:
 * [x] 基于 DER 的验证
 * [x] chunk 级推理
 * [x] 主说话人估计
-* [ ] speaker bank 对接
+* [x] speaker bank 对接
 * [ ] 真实身份输出
 * [ ] 麦克风流式输入
 * [ ] 面向下游系统的部署接口

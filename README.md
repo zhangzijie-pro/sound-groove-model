@@ -22,9 +22,6 @@
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
 
---- 
-<img src="./docs/imgs/model.jpg" alt="WALL·E" width="600"/>
-
 ---
 ## Overview
 
@@ -450,7 +447,7 @@ If you are mainly interested in the earlier verification-style project presentat
 * [x] DER-based validation
 * [x] chunk-level inference
 * [x] dominant speaker estimation
-* [ ] speaker bank integration
+* [x] speaker bank integration
 * [ ] real identity output
 * [ ] streaming microphone pipeline
 * [ ] deployment-friendly downstream interface
