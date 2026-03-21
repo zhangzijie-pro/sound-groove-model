@@ -8,20 +8,16 @@ from speaker_verification.loss.pit import PITLoss
 def _to_scalar_loss(x, device):
     if torch.is_tensor(x):
         return x
-
     if isinstance(x, (float, int)):
         return torch.tensor(float(x), device=device)
-
     if isinstance(x, (tuple, list)):
         if len(x) == 0:
             return torch.tensor(0.0, device=device)
         return _to_scalar_loss(x[0], device)
-
     if isinstance(x, dict):
         for k in ("loss", "total", "diar_loss", "ver_loss"):
             if k in x:
                 return _to_scalar_loss(x[k], device)
-
         s = 0.0
         found = False
         for v in x.values():
@@ -31,12 +27,9 @@ def _to_scalar_loss(x, device):
             elif isinstance(v, (float, int)):
                 s = s + float(v)
                 found = True
-
         if found:
             return _to_scalar_loss(s, device)
-
         return torch.tensor(0.0, device=device)
-
     raise TypeError(f"Unsupported loss type: {type(x)}")
 
 
@@ -48,11 +41,13 @@ class MultiTaskLoss(nn.Module):
         lambda_act=1.0,
         lambda_cnt=0.2,
         lambda_frm=0.5,
-        pos_weight=2.0,
+        pos_weight=4.0,
         pit_pos_weight=1.5,
         proto_eps=1e-8,
-        proto_temperature=0.05,   # ← 理论最优锐利值
-        margin=0.3,               # ← 新增：margin push negatives
+        proto_temperature=0.05,
+        margin=0.3,
+        focal_gamma=2.0,
+        focal_alpha=0.75,
     ):
         super().__init__()
         self.pit_loss = PITLoss(pos_weight=pit_pos_weight)
@@ -64,7 +59,9 @@ class MultiTaskLoss(nn.Module):
         self.lambda_frm = float(lambda_frm)
         self.proto_eps = float(proto_eps)
         self.proto_temperature = float(proto_temperature)
-        self.margin = float(margin)                     # 新增
+        self.margin = float(margin)
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
 
         self.register_buffer(
             "act_pos_weight",
@@ -75,6 +72,7 @@ class MultiTaskLoss(nn.Module):
         self,
         frame_embeds,
         target_matrix,
+        target_activity=None,
         valid_mask=None,
     ):
         device = frame_embeds.device
@@ -101,30 +99,41 @@ class MultiTaskLoss(nn.Module):
             f = frame_embeds[b][vb]                # [Tv, D]
             target = target_matrix[b][vb].float()  # [Tv, K]
 
-            # ---------- prototype contrastive ----------
+            if target_activity is not None:
+                silence_frames = ~target_activity[b][vb].bool()
+                if silence_frames.any():
+                    spk_mask = target.sum(dim=0) > self.proto_eps
+                    n_active = int(spk_mask.sum().item())
+                    if n_active >= 1:
+                        weights = target[:, spk_mask]
+                        denom = weights.sum(dim=0).clamp_min(self.proto_eps)
+                        protos = (weights.unsqueeze(-1) * f.unsqueeze(1)).sum(dim=0) / denom.unsqueeze(-1)
+                        protos = F.normalize(protos, p=2, dim=-1)
+                        silence_sim = torch.matmul(f[silence_frames], protos.T) / self.proto_temperature
+                        silence_push = torch.relu(silence_sim + self.margin).mean()
+                        total_proto_loss += silence_push * 0.5
+                        total_proto_count += silence_push.numel()
+
             spk_mask = target.sum(dim=0) > self.proto_eps
             n_active = int(spk_mask.sum().item())
             if n_active >= 2:
-                weights = target[:, spk_mask]   # [Tv, n_active]
+                weights = target[:, spk_mask]
                 denom = weights.sum(dim=0).clamp_min(self.proto_eps)
-
                 protos = (weights.unsqueeze(-1) * f.unsqueeze(1)).sum(dim=0) / denom.unsqueeze(-1)
-                protos = F.normalize(protos, p=2, dim=-1)    # [n_active, D]
+                protos = F.normalize(protos, p=2, dim=-1)
 
                 sim = torch.matmul(f, protos.T).float() / self.proto_temperature
 
                 pos_mask = weights > 0.5
                 has_pos = pos_mask.any(dim=1)
                 if has_pos.any():
-                    sim_valid = sim[has_pos]                    # [N_valid, n_active]
+                    sim_valid = sim[has_pos]
                     pos_mask_valid = pos_mask[has_pos]
 
-                    # === 关键理论增强：margin push negatives ===
                     sim_denom = sim_valid.clone()
-                    sim_denom[~pos_mask_valid] -= self.margin   # neg sim 下推，严格 contrastive
+                    sim_denom[~pos_mask_valid] -= self.margin
 
                     log_denom = torch.logsumexp(sim_denom, dim=1, keepdim=True)
-
                     neg_inf = torch.full_like(sim_valid, torch.finfo(sim_valid.dtype).min)
                     pos_logits = torch.where(pos_mask_valid, sim_valid, neg_inf)
                     log_pos = torch.logsumexp(pos_logits, dim=1, keepdim=True)
@@ -134,15 +143,12 @@ class MultiTaskLoss(nn.Module):
                     total_proto_loss += proto_loss.sum()
                     total_proto_count += proto_loss.numel()
 
-            # ---------- temporal consistency（你已实现的优秀部分，保留） ----------
             if f.size(0) >= 2:
                 target_bin = (target > 0.5).float()
-                same_set = (target_bin[1:] == target_bin[:-1]).all(dim=1)   # [Tv-1]
-
+                same_set = (target_bin[1:] == target_bin[:-1]).all(dim=1)
                 if same_set.any():
                     diff = f[1:] - f[:-1]
                     temp_loss = (diff.pow(2).sum(dim=1))[same_set]
-
                     total_temp_loss += temp_loss.sum()
                     total_temp_count += temp_loss.numel()
 
@@ -158,18 +164,18 @@ class MultiTaskLoss(nn.Module):
             else frame_embeds.new_tensor(0.0)
         )
 
-        return proto_loss + 0.3 * temp_loss   # temporal 权重保持稳定
+        return proto_loss + 0.3 * temp_loss
 
     def forward(
         self,
-        frame_embeds,       # [B,T,D]
-        slot_logits,        # [B,T,K]
-        pred_activity,      # [B,T]
-        pred_count,         # [B,K]
-        target_matrix,      # [B,T,K]
-        target_activity,    # [B,T]
-        target_count,       # [B]
-        valid_mask=None,    # [B,T]
+        frame_embeds,
+        slot_logits,
+        pred_activity,
+        pred_count,
+        target_matrix,
+        target_activity,
+        target_count,
+        valid_mask=None,
         return_detail=False,
     ):
         device = frame_embeds.device
@@ -188,11 +194,14 @@ class MultiTaskLoss(nn.Module):
             valid_mask = valid_mask.bool().to(device)
 
         act_loss_raw = F.binary_cross_entropy_with_logits(
-            pred_activity,
-            target_activity.float(),
-            reduction="none",
+            pred_activity, target_activity.float(), reduction="none",
             pos_weight=self.act_pos_weight.to(device),
         )
+        if self.focal_gamma > 0:
+            p = torch.sigmoid(pred_activity)
+            p_t = torch.where(target_activity > 0.5, p, 1 - p)
+            focal_weight = self.focal_alpha * (1 - p_t) ** self.focal_gamma
+            act_loss_raw = focal_weight * act_loss_raw
         act_loss = act_loss_raw[valid_mask].mean() if valid_mask.any() else pred_activity.new_tensor(0.0)
 
         # 3) count
@@ -202,10 +211,11 @@ class MultiTaskLoss(nn.Module):
         tc = tc.clamp(0, pred_count.size(1) - 1)
         cnt_loss = F.cross_entropy(pred_count, tc)
 
-        # 4) frame prototype + temporal（已理论最优）
+        # 4) frame prototype
         frm_loss = self._frame_proto_loss(
             frame_embeds=frame_embeds,
             target_matrix=target_matrix,
+            target_activity=target_activity,
             valid_mask=valid_mask,
         )
 

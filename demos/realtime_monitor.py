@@ -8,6 +8,12 @@ import json
 import numpy as np
 import sounddevice as sd
 import torch
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+proj_root = os.path.dirname(current_dir)
+
+sys.path.append(proj_root)
 
 from speaker_verification.audio.features import TARGET_SR
 from speaker_verification.interfaces.diar_interface import *
@@ -33,7 +39,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--feat_dim", type=int, default=80)
     parser.add_argument("--channels", type=int, default=512)
-    parser.add_argument("--emb_dim", type=int, default=192)
+    parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--max_mix_speakers", type=int, default=4)
 
     parser.add_argument("--sr", type=int, default=TARGET_SR)

@@ -9,8 +9,9 @@ loss:
   lambda_act: 1.0
   lambda_cnt: 0.2
   lambda_frm: 0.15
+  lambda_ortho: 0.1
   pos_weight: 2.0
-  pit_pos_weight: 1.5
+  pit_pos_weight: 3.0
   proto_eps: 1.0e-8
   proto_temperature: 0.07
 
@@ -23,9 +24,9 @@ data:
 train:
   seed: 42
   device: "cuda"
-  epochs: 60
-  batch_size: 16
-  num_workers: 2
+  epochs: 15
+  batch_size: 64
+  num_workers: 0
   lr: 3.0e-4
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
@@ -38,25 +39,25 @@ validate:
   activity_threshold: 0.5
 
 output:
-  save_dir: "outputs_318_finetune"
+  save_dir: "outputs_lstmv3_finetune"
   monitor: "val_loss"
   monitor_mode: "min"
   plot_history: true
 
 finetune:
-  checkpoint_path: "outputs_317/best.pt"
+  checkpoint_path: "outputs_lstm_finetune/best.pt"
 
   # 加载模式:
   # full          -> 全量加载旧模型参数，在旧模型基础上继续训练
   # backbone_only -> 只加载 backbone，head 不加载，适合换 head 或重新训 head
-  # load_mode: "backbone_only"
-  load_mode: "full"
+  load_mode: "backbone_only"
+  # load_mode: "full"
 
 
   # 是否严格加载参数
   # full 继续训练时通常可设 true
   # backbone_only 或 head 结构变化时建议 false
-  strict_load: true
+  strict_load: false
 
   # 哪些前缀属于 head
   # 你的代码里默认按 diar_head. 识别 head
@@ -66,7 +67,7 @@ finetune:
   # 是否冻结 backbone
   # true  -> 冻结 backbone，只训练 head
   # false -> backbone 和 head 一起训练
-  freeze_backbone: false
+  freeze_backbone: true 
 
   # 微调学习率倍率
   # 实际 finetune lr = train.lr * lr_scale

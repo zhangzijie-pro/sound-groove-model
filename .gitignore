@@ -217,3 +217,5 @@ eval_staticmix/
 scripts/dscore
 outputs_317/
 outputs_318_finetune/
+outputs_lstm_finetune/
+outputs_lstmv3_finetune/

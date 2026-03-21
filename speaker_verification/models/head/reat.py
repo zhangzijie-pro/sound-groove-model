@@ -2,23 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
-
 class REAT_DiarizationHead(nn.Module):
+    """
+    LSTM v3 + Silence Prototype + Energy Gate + LayerNorm
+    修复了所有重复定义、norm 未定义等问题
+    """
     def __init__(self, in_dim=512, emb_dim=192, num_speakers_max=5):
         super().__init__()
-        self.in_dim = in_dim
         self.emb_dim = emb_dim
         self.max_spk = num_speakers_max
 
@@ -28,32 +18,24 @@ class REAT_DiarizationHead(nn.Module):
             nn.Linear(in_dim, emb_dim),
         )
 
-        # self.pos_encoding = PositionalEncoding(emb_dim)
-        # encoder = nn.TransformerEncoderLayer(
-        #     emb_dim,
-        #     4,
-        #     dim_feedforward=384,
-        #     dropout=0.0,
-        #     activation="relu",
-        #     batch_first=True,
-        #     norm_first=True
-        # )
-        # self.temporal = nn.TransformerEncoder(encoder, 1)
+        self.norm = nn.LayerNorm(emb_dim)
 
+        # LSTM + residual
         self.temporal = nn.LSTM(
             input_size=emb_dim,
-            hidden_size=emb_dim // 2,   # 96
-            num_layers=1,
+            hidden_size=emb_dim // 2,
+            num_layers=2,
             bidirectional=True,
             batch_first=True,
-            dropout=0.0
+            dropout=0.1
         )
+        self.residual = nn.Linear(emb_dim, emb_dim)
 
-        self.prototypes = nn.Parameter(torch.randn(num_speakers_max, emb_dim))
-        self.register_buffer("prototype_momentum", torch.tensor(0.99))
+        self.silence_proto = nn.Parameter(torch.randn(1, emb_dim))
+        self.speaker_protos = nn.Parameter(torch.randn(num_speakers_max, emb_dim))
+        self.slot_scale = nn.Parameter(torch.tensor(30.0))
 
-        self.slot_scale = nn.Parameter(torch.tensor(30.0))  # learnable temperature
-
+        # Heads
         self.activity_head = nn.Sequential(
             nn.Linear(emb_dim, emb_dim // 2),
             nn.ReLU(inplace=True),
@@ -70,21 +52,26 @@ class REAT_DiarizationHead(nn.Module):
         frame_feat: [B, T, 512]
         """
         embeds = self.frame_proj(frame_feat)          # [B,T,192]
+
+        # Energy gate + normalize + LayerNorm + noise
+        energy = frame_feat.abs().mean(dim=-1, keepdim=True) + 1e-8
+        embeds = embeds * torch.sigmoid(energy * 5.0)
         embeds = F.normalize(embeds, dim=-1)
+        embeds = self.norm(embeds)
+        if self.training:
+            embeds = embeds + torch.randn_like(embeds) * 0.005
 
-        # embeds = self.pos_encoding(embeds)
-        # temporal_out = self.temporal(embeds)          # [B,T,192]
-        # frame_embeds = F.normalize(temporal_out, dim=-1)
-
-        # LSTM
-        temporal_out, _ = self.temporal(embeds)       # [B,T,192]
+        # LSTM + residual
+        temporal_out, _ = self.temporal(embeds)
+        temporal_out = temporal_out + self.residual(embeds)
         frame_embeds = F.normalize(temporal_out, dim=-1)
 
-        sim = torch.matmul(frame_embeds, self.prototypes.T) * self.slot_scale
-        slot_logits = sim  # [B,T,K]
+        # Slot logits（K+1）
+        all_protos = torch.cat([self.silence_proto, self.speaker_protos], dim=0)
+        sim = torch.matmul(frame_embeds, all_protos.T) * self.slot_scale
+        slot_logits = sim  # [B, T, K+1]
 
         activity_logits = self.activity_head(frame_embeds).squeeze(-1)
-
         utt_feat = frame_embeds.mean(dim=1)
         count_logits = self.count_head(utt_feat)
 

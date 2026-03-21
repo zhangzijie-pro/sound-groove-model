@@ -298,7 +298,7 @@ def main(cfg: DictConfig):
 
         if _HAS_PLOT and cfg.output.plot_history:
             try:
-                plot_curves(history, cfg.output.save_dir)
+                plot_curves(cfg.output.save_dir, history)
             except Exception as e:
                 logger.warning("[Epoch %d] plot failed: %s", epoch, e)
 

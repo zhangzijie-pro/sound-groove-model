@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from speaker_verification.models.resowave import ResoWave
-
+from speaker_verification.audio.features import *
 
 class SpeakerBankProtocol(Protocol):
     def identify(self, embedding: torch.Tensor) -> Dict[str, Any]:
@@ -155,6 +155,7 @@ class SpeakerAwareDiarizationInterface:
         self.frame_shift_sec = float(frame_shift_sec)
         self.min_active_frames = int(min_active_frames)
         self.min_slot_run = int(min_slot_run)
+        self.feat_dim = feat_dim
         self.speaker_bank = speaker_bank or EmptySpeakerBank()
 
         self.model = ResoWave(
@@ -165,9 +166,40 @@ class SpeakerAwareDiarizationInterface:
         ).to(self.device)
 
         ckpt = torch.load(ckpt_path, map_location=self.device)
-        state_dict = ckpt.get("model") or ckpt.get("state_dict") or ckpt
+        state_dict = ckpt.get("model_state") or ckpt.get("state_dict") or ckpt
         self.model.load_state_dict(state_dict, strict=True)
         self.model.eval()
+
+    @torch.no_grad()
+    def infer_wav(
+        self,
+        wav: torch.Tensor,
+        sample_rate: int = 16000,
+        crop_sec: Optional[float] = None,
+        crop_mode: Literal["tail", "center", "none"] = "tail",
+        normalize: bool = True,
+    ) -> ChunkInferenceResult:
+        if wav.dim() == 2 and wav.shape[0] == 1:
+            wav = wav.squeeze(0)
+        if wav.dim() != 1:
+            raise ValueError(f"Expected mono wav [T] or [1,T], got {wav.shape}")
+
+        if sample_rate != TARGET_SR:
+            wav = torchaudio.functional.resample(wav, sample_rate, TARGET_SR)
+
+        if normalize and wav.abs().max() > 0:
+            wav = wav / wav.abs().max()
+
+        fbank = wav_to_fbank_infer(
+            wav_16k=wav,
+            n_mels=self.feat_dim,
+            crop_sec=crop_sec,
+            crop_mode=crop_mode,
+        )   # → [T_frames, 80]
+
+        result = self.infer_fbank(fbank)
+
+        return result
 
     @torch.no_grad()
     def infer_fbank(self, fbank: torch.Tensor) -> ChunkInferenceResult:
@@ -180,7 +212,15 @@ class SpeakerAwareDiarizationInterface:
             raise ValueError(f"Expected [T,F] or [1,T,F], got {tuple(fbank.shape)}")
 
         fbank = fbank.to(self.device)
-
+        energy = torch.norm(fbank, dim=-1)
+        if energy.mean() < 0.015:
+            return {
+                "num_speakers": 0,
+                "activity_ratio": 0.0,
+                "slots": [],
+                "segments": [],
+                "dominant_speaker": None
+            }
         _, frame_embeds, slot_logits, activity_logits, count_logits = self.model(
             fbank, return_diarization=True
         )

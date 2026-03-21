@@ -94,6 +94,7 @@ def build_loss(cfg, device):
         lambda_act=cfg.loss.lambda_act,
         lambda_cnt=cfg.loss.lambda_cnt,
         lambda_frm=cfg.loss.lambda_frm,
+        # lambda_ortho=cfg.loss.lambda_ortho,
         pos_weight=cfg.loss.pos_weight,
         pit_pos_weight=cfg.loss.pit_pos_weight,
         proto_eps=cfg.loss.proto_eps,

@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from speaker_verification.models.resowave import ResoWave
 from speaker_verification.loss.mulit_task import MultiTaskLoss
 from dataset.staticdataset import StaticMixDataset
-from train import validate
+from utils.utils import validate
 
 
 def main():
@@ -17,7 +17,7 @@ def main():
 
     parser.add_argument("--feat_dim", type=int, default=80)
     parser.add_argument("--channels", type=int, default=512)
-    parser.add_argument("--emb_dim", type=int, default=192)
+    parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--max_mix_speakers", type=int, default=4)
 
     parser.add_argument("--lambda_pit", type=float, default=1.0)
@@ -97,5 +97,7 @@ if __name__ == "__main__":
     main()
 
 """
-python verify.py --ckpt outputs3/best.pt --data_out_dir processed/static_mix_cnceleb2 --manifest val_manifest.jsonl
+python verify.py --ckpt outputs_lstm_finetune/best.pt --data_out_dir processed/static_mix_cnceleb2 --manifest val_manifest.jsonl --max_mix_speakers 4 --max_batches 1000 --batch_size 16
+
+
 """
