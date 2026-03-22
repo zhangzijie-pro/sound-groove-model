@@ -53,6 +53,7 @@ class DERTracker:
             "der": self.value(),
         }
 
+
 @torch.no_grad()
 def diarization_error_rate_pit(
     slot_logits,
@@ -62,33 +63,51 @@ def diarization_error_rate_pit(
     return_detail=False,
 ):
     """
-    内部训练用帧级 PIT-DER，支持 slot_logits K > target_matrix K 的情况
-    （例如加了 silence prototype 后 K=5/6，但 target 仍是 4）
+    训练/验证内部使用的帧级 PIT-DER。
+
+    约定：
+    - 若 slot_logits 最后一维 == target_matrix 最后一维 + 1，
+      则认为 slot_logits[..., 0] 为 silence slot；
+      speaker slots 为 slot_logits[..., 1:].
+    - DER 统计只基于 speaker slots，不把 silence 当 speaker 参与匹配。
     """
     from utils.matching import hungarian_match_logits
 
-    target_matrix = target_matrix.float()
+    device = slot_logits.device
+    target_matrix = target_matrix.float().to(device)
 
-    K_logit = slot_logits.shape[-1]
-    K_tgt   = target_matrix.shape[-1]
-    K = min(K_logit, K_tgt)
+    B, T, K_logit = slot_logits.shape
+    _, _, K_tgt = target_matrix.shape
 
-    pred_bin_full = hungarian_match_logits(slot_logits, target_matrix, valid_mask=valid_mask)  # [B,T,K_logit]
+    has_silence = (K_logit == K_tgt + 1)
 
-    pred_bin = pred_bin_full[:, :, :K]          # [B, T, K]
-    target_sel = target_matrix[:, :, :K]        # [B, T, K]
+    pred_bin_full = hungarian_match_logits(
+        slot_logits,
+        target_matrix,
+        valid_mask=valid_mask,
+    )  # [B, T, K_logit]
+
+    if has_silence:
+        pred_bin = pred_bin_full[..., 1:]  # 只保留 speaker slots
+    else:
+        pred_bin = pred_bin_full
+
+    K = min(pred_bin.size(-1), K_tgt)
+    pred_bin = pred_bin[..., :K]              # [B, T, K]
+    target_sel = target_matrix[..., :K]       # [B, T, K]
 
     gt_activity = (target_matrix.sum(dim=-1) > 0)
     pred_activity = (pred_bin.sum(dim=-1) > 0)
 
     if valid_mask is None:
-        valid_mask = torch.ones_like(gt_activity, dtype=torch.bool)
+        valid_mask = torch.ones_like(gt_activity, dtype=torch.bool, device=device)
     else:
-        valid_mask = valid_mask.bool()
+        valid_mask = valid_mask.bool().to(device)
 
     fa = ((pred_activity == 1) & (gt_activity == 0) & valid_mask).sum().float()
     miss = ((pred_activity == 0) & (gt_activity == 1) & valid_mask).sum().float()
 
+    # confusion：仅在 GT 活跃帧上统计 slot 错配
     frame_slot_mismatch = ((pred_bin != target_sel).float().sum(dim=-1) > 0)
     conf = (frame_slot_mismatch & gt_activity & valid_mask).sum().float()
 
@@ -126,10 +145,16 @@ def compute_activity_metrics(pred_act_logits, target_act, valid_mask, threshold=
 
 @torch.no_grad()
 def compute_count_acc(pred_count_logits, target_count):
-    pred = pred_count_logits.argmax(dim=1)  # [B], 0..K-1
+    """
+    现在 count 类别定义为：
+    0 -> 0 speakers
+    1 -> 1 speaker
+    2 -> 2 speakers
+    ...
+    K -> K speakers
+    """
+    pred = pred_count_logits.argmax(dim=1)  # [B], 0..K
     gt = target_count.long()
-    if gt.numel() > 0 and gt.min().item() >= 1:
-        gt = gt - 1
     gt = gt.clamp(0, pred_count_logits.size(1) - 1)
     acc = (pred == gt).float().mean().item()
     return acc

@@ -60,8 +60,8 @@ class MultiTaskLoss(nn.Module):
         self.proto_eps = float(proto_eps)
         self.proto_temperature = float(proto_temperature)
         self.margin = float(margin)
-        self.focal_gamma = focal_gamma
-        self.focal_alpha = focal_alpha
+        self.focal_gamma = float(focal_gamma)
+        self.focal_alpha = float(focal_alpha)
 
         self.register_buffer(
             "act_pos_weight",
@@ -183,7 +183,7 @@ class MultiTaskLoss(nn.Module):
         target_activity = target_activity.to(device)
         target_count = target_count.to(device)
 
-        # 1) PIT
+        # 1) PIT：内部已自动跳过 silence slot
         pit_loss = self.pit_loss(slot_logits, target_matrix, valid_mask=valid_mask)
         pit_loss = _to_scalar_loss(pit_loss, device)
 
@@ -194,20 +194,22 @@ class MultiTaskLoss(nn.Module):
             valid_mask = valid_mask.bool().to(device)
 
         act_loss_raw = F.binary_cross_entropy_with_logits(
-            pred_activity, target_activity.float(), reduction="none",
+            pred_activity,
+            target_activity.float(),
+            reduction="none",
             pos_weight=self.act_pos_weight.to(device),
         )
+
         if self.focal_gamma > 0:
             p = torch.sigmoid(pred_activity)
             p_t = torch.where(target_activity > 0.5, p, 1 - p)
             focal_weight = self.focal_alpha * (1 - p_t) ** self.focal_gamma
             act_loss_raw = focal_weight * act_loss_raw
+
         act_loss = act_loss_raw[valid_mask].mean() if valid_mask.any() else pred_activity.new_tensor(0.0)
 
-        # 3) count
+        # 3) count：支持 0..K
         tc = target_count.long().to(device)
-        if tc.numel() > 0 and tc.min().item() >= 1:
-            tc = tc - 1
         tc = tc.clamp(0, pred_count.size(1) - 1)
         cnt_loss = F.cross_entropy(pred_count, tc)
 
