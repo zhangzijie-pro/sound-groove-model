@@ -53,7 +53,6 @@ class DERTracker:
             "der": self.value(),
         }
 
-
 @torch.no_grad()
 def diarization_error_rate_pit(
     slot_logits,
@@ -63,14 +62,21 @@ def diarization_error_rate_pit(
     return_detail=False,
 ):
     """
-    内部训练用帧级 PIT-DER，不等同于标准 RTTM dscore。
-    slot_logits:  [B, T, K]
-    target_matrix:[B, T, K]
+    内部训练用帧级 PIT-DER，支持 slot_logits K > target_matrix K 的情况
+    （例如加了 silence prototype 后 K=5/6，但 target 仍是 4）
     """
     from utils.matching import hungarian_match_logits
 
     target_matrix = target_matrix.float()
-    pred_bin = hungarian_match_logits(slot_logits, target_matrix, valid_mask=valid_mask)  # [B,T,K]
+
+    K_logit = slot_logits.shape[-1]
+    K_tgt   = target_matrix.shape[-1]
+    K = min(K_logit, K_tgt)
+
+    pred_bin_full = hungarian_match_logits(slot_logits, target_matrix, valid_mask=valid_mask)  # [B,T,K_logit]
+
+    pred_bin = pred_bin_full[:, :, :K]          # [B, T, K]
+    target_sel = target_matrix[:, :, :K]        # [B, T, K]
 
     gt_activity = (target_matrix.sum(dim=-1) > 0)
     pred_activity = (pred_bin.sum(dim=-1) > 0)
@@ -83,7 +89,7 @@ def diarization_error_rate_pit(
     fa = ((pred_activity == 1) & (gt_activity == 0) & valid_mask).sum().float()
     miss = ((pred_activity == 0) & (gt_activity == 1) & valid_mask).sum().float()
 
-    frame_slot_mismatch = ((pred_bin != target_matrix).float().sum(dim=-1) > 0)
+    frame_slot_mismatch = ((pred_bin != target_sel).float().sum(dim=-1) > 0)
     conf = (frame_slot_mismatch & gt_activity & valid_mask).sum().float()
 
     gt_active = (gt_activity & valid_mask).sum().float()

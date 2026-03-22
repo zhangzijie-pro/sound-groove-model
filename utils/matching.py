@@ -12,25 +12,39 @@ def hungarian_match_logits(slot_logits, target_matrix, valid_mask=None):
 
     if valid_mask is None:
         valid_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+    else:
+        valid_mask = valid_mask.bool()
 
-    pred_prob = torch.sigmoid(slot_logits[:, :, :K])          # [B,T,K]
-    target_sel = target_matrix[:, :, :K]                      # [B,T,K]
+    logits_sel = slot_logits[:, :, :K]          # [B, T, K]
+    target_sel = target_matrix[:, :, :K]        # [B, T, K]
 
-    # Vectorized BCE cost matrix [B, K, K]
-    pred_exp = pred_prob.unsqueeze(2)                         # [B,T,K,1]
-    tgt_exp  = target_sel.unsqueeze(1)                        # [B,T,1,K]
-    bce = F.binary_cross_entropy(pred_exp, tgt_exp, reduction='none')  # [B,T,K,K]
+    logits_exp = logits_sel.unsqueeze(-1)       # [B, T, K, 1]
+    target_exp = target_sel.unsqueeze(-2)       # [B, T, 1, K]
 
-    vm_4d = valid_mask.unsqueeze(1).unsqueeze(-1)             # [B,1,T,1] → broadcasts
-    cost_per_frame = bce * vm_4d
-    cost = cost_per_frame.sum(dim=2) / valid_mask.sum(dim=1, keepdim=True).clamp(min=1.0).unsqueeze(-1)
-    cost = cost.squeeze(1)                                    # [B, K, K]
+    logits_exp = logits_exp.expand(-1, -1, -1, K)
+    target_exp = target_exp.expand(-1, -1, K, -1)
 
-    reordered = torch.zeros((B, T, K_logit), device=device)
+    bce = F.binary_cross_entropy_with_logits(
+        logits_exp,
+        target_exp,
+        reduction='none'
+    )   # [B, T, K, K]
+
+    vm_4d = valid_mask.unsqueeze(-1).unsqueeze(-1)      # [B, T, 1, 1]
+    masked_bce = bce * vm_4d
+
+    cost_per_sample = masked_bce.sum(dim=1)
+
+    valid_frames = valid_mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
+    cost = cost_per_sample / valid_frames.unsqueeze(-1)                # [B, K, K]
+
+    reordered = torch.zeros((B, T, K_logit), dtype=torch.float32, device=device)
 
     for b in range(B):
+        if K == 0:
+            continue
         row_ind, col_ind = linear_sum_assignment(cost[b].cpu().numpy())
         for r, c in zip(row_ind, col_ind):
-            reordered[b, :, c] = (pred_prob[b, :, r] >= 0.5).float()
+            reordered[b, :, c] = (logits_sel[b, :, r] >= 0.0).float()
 
     return reordered
