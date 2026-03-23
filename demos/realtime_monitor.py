@@ -1,22 +1,25 @@
 import argparse
+import json
+import os
 import queue
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 
-import json
 import numpy as np
 import sounddevice as sd
 import torch
-import os
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 proj_root = os.path.dirname(current_dir)
-
 sys.path.append(proj_root)
 
 from speaker_verification.audio.features import TARGET_SR
-from speaker_verification.interfaces.diar_interface import *
+from speaker_verification.interfaces.diar_interface import (
+    EmptySpeakerBank,
+    SpeakerAwareDiarizationInterface,
+)
+
 
 class AudioRingBuffer:
     def __init__(self, max_seconds: float, sr: int):
@@ -33,6 +36,20 @@ class AudioRingBuffer:
             return np.zeros(0, dtype=np.float32)
         return np.asarray(self.buf, dtype=np.float32)
 
+
+def compute_rms_np(x: np.ndarray) -> float:
+    if x.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(x)) + 1e-12))
+
+
+def majority_vote(values):
+    if not values:
+        return 0
+    c = Counter(values)
+    return c.most_common(1)[0][0]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True)
@@ -43,12 +60,20 @@ def main():
     parser.add_argument("--max_mix_speakers", type=int, default=4)
 
     parser.add_argument("--sr", type=int, default=TARGET_SR)
-    parser.add_argument("--chunk_sec", type=float, default=4.0)
+    parser.add_argument("--chunk_sec", type=float, default=2.0)
     parser.add_argument("--step_sec", type=float, default=1.0)
-    parser.add_argument("--activity_threshold", type=float, default=0.5)
 
+    parser.add_argument("--activity_threshold", type=float, default=0.55)
     parser.add_argument("--min_active_frames", type=int, default=3)
     parser.add_argument("--min_slot_run", type=int, default=3)
+
+    parser.add_argument("--wav_rms_threshold", type=float, default=0.008)
+    parser.add_argument("--fbank_energy_threshold", type=float, default=0.020)
+    parser.add_argument("--min_activity_ratio", type=float, default=0.15)
+    parser.add_argument("--min_mean_activity_prob", type=float, default=0.40)
+
+    parser.add_argument("--display_top_segments", type=int, default=10)
+    parser.add_argument("--smooth_windows", type=int, default=5)
     parser.add_argument("--print_json", action="store_true")
 
     args = parser.parse_args()
@@ -68,10 +93,16 @@ def main():
         min_active_frames=args.min_active_frames,
         min_slot_run=args.min_slot_run,
         speaker_bank=EmptySpeakerBank(),
+        wav_rms_threshold=args.wav_rms_threshold,
+        fbank_energy_threshold=args.fbank_energy_threshold,
+        min_activity_ratio=args.min_activity_ratio,
+        min_mean_activity_prob=args.min_mean_activity_prob,
     )
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
     ring = AudioRingBuffer(max_seconds=args.chunk_sec, sr=args.sr)
+
+    smooth_num_speakers = deque(maxlen=max(1, args.smooth_windows))
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -91,7 +122,7 @@ def main():
         channels=1,
         dtype="float32",
         callback=callback,
-        blocksize=int(args.sr * 0.2),  # 200 ms
+        blocksize=int(args.sr * 0.2),
     ):
         try:
             while True:
@@ -109,34 +140,62 @@ def main():
                 if wav.shape[0] < int(args.chunk_sec * args.sr * 0.8):
                     continue
 
-                wav_tensor = torch.from_numpy(wav).float()
-                result = monitor.infer_wav(wav_tensor, crop_sec=args.chunk_sec)
-                result_json = monitor.to_jsonable(result)
+                wav_rms = compute_rms_np(wav)
+                if wav_rms < args.wav_rms_threshold:
+                    result_json = {
+                        "num_speakers": 0,
+                        "dominant_speaker": None,
+                        "activity_ratio": 0.0,
+                        "slots": [],
+                        "segments": [],
+                    }
+                else:
+                    wav_tensor = torch.from_numpy(wav).float()
+                    result = monitor.infer_wav(
+                        wav_tensor,
+                        sample_rate=args.sr,
+                        crop_sec=args.chunk_sec,
+                        crop_mode="tail",
+                        normalize=True,
+                    )
+                    result_json = monitor.to_jsonable(result)
+
+                smooth_num_speakers.append(int(result_json["num_speakers"]))
+                stable_num_speakers = majority_vote(list(smooth_num_speakers))
+                result_json["num_speakers_stable"] = stable_num_speakers
 
                 print("\n" + "-" * 80)
                 print(
                     f"[Realtime] "
-                    f"num_speakers={result_json['num_speakers']} | "
+                    f"num_speakers={result_json['num_speakers']} "
+                    f"(stable={result_json['num_speakers_stable']}) | "
                     f"dominant_speaker={result_json['dominant_speaker']} | "
-                    f"activity_ratio={result_json['activity_ratio']:.3f}"
+                    f"activity_ratio={result_json['activity_ratio']:.3f} | "
+                    f"wav_rms={wav_rms:.5f}"
                 )
 
-                for slot in result_json["slots"]:
-                    print(
-                        f"  slot={slot['slot']} "
-                        f"name={slot['name']} "
-                        f"known={slot['is_known']} "
-                        f"dur={slot['duration_sec']:.2f}s "
-                        f"frames={slot['num_frames']} "
-                        f"score={slot['score']}"
-                    )
+                if len(result_json["slots"]) == 0:
+                    print("  no active speaker slots")
+                else:
+                    for slot in result_json["slots"]:
+                        print(
+                            f"  slot={slot['slot']} "
+                            f"name={slot['name']} "
+                            f"known={slot['is_known']} "
+                            f"dur={slot['duration_sec']:.2f}s "
+                            f"frames={slot['num_frames']} "
+                            f"score={slot['score']}"
+                        )
 
                 print("  segments:")
-                for seg in result_json["segments"][:10]:
-                    print(
-                        f"    [{seg['start_sec']:.2f}s - {seg['end_sec']:.2f}s] "
-                        f"slot={seg['slot']} name={seg['name']}"
-                    )
+                if len(result_json["segments"]) == 0:
+                    print("    []")
+                else:
+                    for seg in result_json["segments"][: args.display_top_segments]:
+                        print(
+                            f"    [{seg['start_sec']:.2f}s - {seg['end_sec']:.2f}s] "
+                            f"slot={seg['slot']} name={seg['name']}"
+                        )
 
                 if args.print_json:
                     print(json.dumps(result_json, ensure_ascii=False, indent=2))
