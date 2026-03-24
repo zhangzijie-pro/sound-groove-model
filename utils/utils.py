@@ -1,6 +1,5 @@
 from datetime import datetime
 import os
-import json
 import logging
 from pathlib import Path
 
@@ -22,13 +21,6 @@ from utils.meters import (
     compute_count_acc,
     compute_activity_metrics,
 )
-from utils.utils import *
-
-try:
-    from utils.plot import plot_curves
-    _HAS_PLOT = True
-except Exception:
-    _HAS_PLOT = False
 
 
 def setup_logger(out_dir: str, logger_name: str = "train_logger"):

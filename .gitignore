@@ -205,18 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-outputs/
 *.wav
 CN-Celeb_flac/
-outputs_static_pit/
 processed/cn_celeb2/
 processed/static_mix_cnceleb2/
 
-outputs3/
+outputs/
 eval_staticmix/
-scripts/dscore
-outputs_317/
-outputs_318_finetune/
-outputs_lstm_finetune/
-outputs_lstmv322_neg_sample_finetune/
 outputs_lstm_neg_signle_sample_finetune/

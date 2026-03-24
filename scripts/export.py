@@ -86,6 +86,37 @@ class ModelExporter:
         with open(self.out_dir / "meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
 
+    def spilt_single_head(self, ckpt_path, out_path):
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+
+        full_state_dict = ckpt["model_state"]
+
+        diar_model = ResoWave(
+            in_channels=80,
+            channels=512,
+            embd_dim=256,
+            max_mix_speakers=4
+        )
+
+        new_state_dict = {}
+        keep_prefixes = ['layer1.', 'layer2.', 'layer3.', 'layer4.', 'diar_head.']
+
+        for k, v in full_state_dict.items():
+            if any(k.startswith(prefix) for prefix in keep_prefixes):
+                new_state_dict[k] = v
+
+        missing, unexpected = diar_model.load_state_dict(new_state_dict, strict=False)
+
+        print(f"Missing : {missing}, unexpected: {unexpected}")
+
+        out_ckpt_path = os.path.join(out_path, "resowave_clear.pt")
+
+        torch.save({
+            'model_state_dict': diar_model.state_dict()
+        }, out_ckpt_path)
+
+        print(f"\n🎉 拆分完成")
+
     def load_model(self):
         print("加载 ResoWave...")
         self.model = ResoWave(
@@ -158,6 +189,9 @@ def main():
     parser.add_argument("--split", action="store_true", default=True,
                         help="是否拆分 checkpoint (默认: True)")
     
+    parser.add_argument("--split_pithy", default=False,
+                        help="是否拆分 checkpoint 为简洁版 (默认: False)")
+    
     parser.add_argument("--onnx", action="store_true", default=True,
                         help="是否导出 ONNX (默认: True)")
     
@@ -182,6 +216,9 @@ def main():
 
     if args.split:
         exporter.split_checkpoint()
+
+    if args.split_pithy:
+        exporter.spilt_single_head(ckpt_path=args.ckpt, out_dir=args.out_dir)
 
     if args.onnx:
         exporter.export_onnx(

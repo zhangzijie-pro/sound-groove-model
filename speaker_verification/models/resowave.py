@@ -131,3 +131,38 @@ class ResoWave(nn.Module):
             return emb, frame_embeds, slot_logits, activity_logits, count_logits
 
         return emb
+
+# class ResoWave(nn.Module):
+#     def __init__(
+#         self,
+#         in_channels=80,
+#         channels=512,
+#         embd_dim=192,
+#         max_mix_speakers=5,
+#     ):
+#         super().__init__()
+#         self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)
+#         self.layer2 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=2, dilation=2, scale=8)
+#         self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
+#         self.layer4 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
+
+#         self.diar_head = REAT_DiarizationHead(
+#             in_dim=channels,
+#             emb_dim=embd_dim,
+#             num_speakers_max=max_mix_speakers,
+#         )
+
+#     def forward(self, x):
+#         """
+#         x: [B,T,80]
+#         """
+#         x = x.transpose(1, 2)  # [B,80,T]
+
+#         out1 = self.layer1(x)
+#         out2 = self.layer2(out1)
+#         out3 = self.layer3(out1 + out2)
+#         out4 = self.layer4(out1 + out2 + out3)  # [B,512,T]
+
+#         frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
+#         frame_embeds, slot_logits, activity_logits, count_logits = self.diar_head(frame_feat)
+#         return frame_embeds, slot_logits, activity_logits, count_logits
