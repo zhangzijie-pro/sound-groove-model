@@ -2,6 +2,7 @@ torch
 torchaudio
 numpy
 scikit-learn
+scipy
 matplotlib
 tqdm
 hydra-core

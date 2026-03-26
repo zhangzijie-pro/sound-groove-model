@@ -10,7 +10,7 @@ def build_model(cfg, device):
     model = ResoWave(
         in_channels=cfg.model.in_channels,
         channels=cfg.model.channels,
-        embedding_dim=cfg.model.embedding_dim,
+        embd_dim=cfg.model.embedding_dim,
         max_mix_speakers=cfg.model.max_mix_speakers,
     )
     return model.to(device)

@@ -42,7 +42,7 @@ validate:
 
 output:
   save_dir: "outputs/default"
-  monitor: "val_loss"      # 例如 val_loss / der / act_f1
+  monitor: "val_loss"      # choice: val_loss / der / act_f1
   monitor_mode: "min"      # min | max
   plot_history: true
 
