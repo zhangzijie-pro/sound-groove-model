@@ -5,18 +5,6 @@ from scipy.optimize import linear_sum_assignment
 
 @torch.no_grad()
 def hungarian_match_logits(slot_logits, target_matrix, valid_mask=None):
-    """
-    将预测 slot 与 target speaker slots 做 Hungarian 对齐，并输出重排后的二值预测。
-
-    约定：
-    - 若 slot_logits.shape[-1] == target_matrix.shape[-1] + 1，
-      则 slot_logits[..., 0] 为 silence slot，speaker slots 为 1:.
-    - 返回：
-        pred_bin_full: [B, T, K_full]
-      其中：
-        - 若输入含 silence slot，则 pred_bin_full[..., 0] 是 silence 的二值结果
-        - 对齐后的 speaker 结果放在 pred_bin_full[..., 1:1+K]
-    """
     device = slot_logits.device
     target_matrix = target_matrix.float().to(device)
 
@@ -42,7 +30,6 @@ def hungarian_match_logits(slot_logits, target_matrix, valid_mask=None):
 
     pred_bin_full = torch.zeros((B, T, K_logit), dtype=torch.float32, device=device)
 
-    # 先填 silence
     if has_silence:
         pred_bin_full[..., 0] = (silence_logits[..., 0] >= 0.0).float()
 

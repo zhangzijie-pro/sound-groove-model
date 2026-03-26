@@ -17,10 +17,6 @@ class AverageMeter:
 
 
 class DERTracker:
-    """
-    全局累计 DER 统计器：
-    最终用全局 sum(fa/miss/conf) / sum(gt_active)
-    """
     def __init__(self):
         self.reset()
 
@@ -62,15 +58,6 @@ def diarization_error_rate_pit(
     valid_mask=None,
     return_detail=False,
 ):
-    """
-    训练/验证内部使用的帧级 PIT-DER。
-
-    约定：
-    - 若 slot_logits 最后一维 == target_matrix 最后一维 + 1，
-      则认为 slot_logits[..., 0] 为 silence slot；
-      speaker slots 为 slot_logits[..., 1:].
-    - DER 统计只基于 speaker slots，不把 silence 当 speaker 参与匹配。
-    """
     from utils.matching import hungarian_match_logits
 
     device = slot_logits.device
@@ -88,7 +75,7 @@ def diarization_error_rate_pit(
     )  # [B, T, K_logit]
 
     if has_silence:
-        pred_bin = pred_bin_full[..., 1:]  # 只保留 speaker slots
+        pred_bin = pred_bin_full[..., 1:]
     else:
         pred_bin = pred_bin_full
 
@@ -107,7 +94,6 @@ def diarization_error_rate_pit(
     fa = ((pred_activity == 1) & (gt_activity == 0) & valid_mask).sum().float()
     miss = ((pred_activity == 0) & (gt_activity == 1) & valid_mask).sum().float()
 
-    # confusion：仅在 GT 活跃帧上统计 slot 错配
     frame_slot_mismatch = ((pred_bin != target_sel).float().sum(dim=-1) > 0)
     conf = (frame_slot_mismatch & gt_activity & valid_mask).sum().float()
 
@@ -145,14 +131,6 @@ def compute_activity_metrics(pred_act_logits, target_act, valid_mask, threshold=
 
 @torch.no_grad()
 def compute_count_acc(pred_count_logits, target_count):
-    """
-    现在 count 类别定义为：
-    0 -> 0 speakers
-    1 -> 1 speaker
-    2 -> 2 speakers
-    ...
-    K -> K speakers
-    """
     pred = pred_count_logits.argmax(dim=1)  # [B], 0..K
     gt = target_count.long()
     gt = gt.clamp(0, pred_count_logits.size(1) - 1)
