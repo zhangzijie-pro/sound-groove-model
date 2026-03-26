@@ -54,7 +54,6 @@ class EPA_WRR_Mixer(nn.Module):
         self.phase_conv = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
         self.phase_proj = nn.Linear(channels, channels)
         
-        # self.pos_encoding = PositionalEncoding(d_model=channels)
         self.scale_routers = nn.ModuleList([
             nn.Linear(channels, 1) for _ in range(wt_levels + 1)
         ])
@@ -83,8 +82,6 @@ class EPA_WRR_Mixer(nn.Module):
         gate = self.energy_gate(energy_score)             # (B, T, 1)
         gate = gate.transpose(1, 2)                       # (B, 1, T)
         x = x * gate
-        
-        # x = self.pos_encoding(x)
         
         phase_proxy = torch.tanh(self.phase_conv(x))
         phase_feat = self.phase_proj(phase_proxy.transpose(1, 2)).transpose(1, 2)  # (B, C, T)

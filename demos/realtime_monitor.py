@@ -19,20 +19,19 @@ from speaker_verification.interfaces.diar_interface import (
     EmptySpeakerBank,
     SpeakerAwareDiarizationInterface,
 )
+from speaker_verification.interfaces.global_tracker import GlobalSpeakerTracker
 
 
 class AudioRingBuffer:
     def __init__(self, max_seconds: float, sr: int):
-        self.sr = sr
         self.max_samples = int(max_seconds * sr)
         self.buf = deque(maxlen=self.max_samples)
 
     def append(self, x: np.ndarray):
-        for v in x.tolist():
-            self.buf.append(v)
+        self.buf.extend(x.astype(np.float32).tolist())
 
     def get_array(self) -> np.ndarray:
-        if len(self.buf) == 0:
+        if not self.buf:
             return np.zeros(0, dtype=np.float32)
         return np.asarray(self.buf, dtype=np.float32)
 
@@ -46,8 +45,24 @@ def compute_rms_np(x: np.ndarray) -> float:
 def majority_vote(values):
     if not values:
         return 0
-    c = Counter(values)
-    return c.most_common(1)[0][0]
+    return Counter(values).most_common(1)[0][0]
+
+
+def segments_with_global_ids(result, local_to_global):
+    out = []
+    for seg in result.segments:
+        gid = local_to_global.get(int(seg.slot), 0)
+        out.append(
+            {
+                "slot": int(seg.slot),
+                "global_id": int(gid),
+                "name": seg.name,
+                "start_sec": float(seg.start_sec),
+                "end_sec": float(seg.end_sec),
+                "duration_sec": float(seg.duration_sec),
+            }
+        )
+    return out
 
 
 def main():
@@ -72,6 +87,10 @@ def main():
     parser.add_argument("--min_activity_ratio", type=float, default=0.15)
     parser.add_argument("--min_mean_activity_prob", type=float, default=0.40)
 
+    parser.add_argument("--tracker_match_threshold", type=float, default=0.72)
+    parser.add_argument("--tracker_momentum", type=float, default=0.90)
+    parser.add_argument("--tracker_max_misses", type=int, default=30)
+
     parser.add_argument("--display_top_segments", type=int, default=10)
     parser.add_argument("--smooth_windows", type=int, default=5)
     parser.add_argument("--print_json", action="store_true")
@@ -93,16 +112,23 @@ def main():
         min_active_frames=args.min_active_frames,
         min_slot_run=args.min_slot_run,
         speaker_bank=EmptySpeakerBank(),
-        wav_rms_threshold=args.wav_rms_threshold,
         fbank_energy_threshold=args.fbank_energy_threshold,
         min_activity_ratio=args.min_activity_ratio,
         min_mean_activity_prob=args.min_mean_activity_prob,
+    )
+
+    tracker = GlobalSpeakerTracker(
+        match_threshold=args.tracker_match_threshold,
+        momentum=args.tracker_momentum,
+        max_misses=args.tracker_max_misses,
+        device="cpu",
     )
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
     ring = AudioRingBuffer(max_seconds=args.chunk_sec, sr=args.sr)
 
     smooth_num_speakers = deque(maxlen=max(1, args.smooth_windows))
+    last_infer_time = 0.0
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -111,11 +137,9 @@ def main():
         audio_q.put(mono.copy())
 
     print("=" * 80)
-    print("Realtime diarization monitor started")
+    print("Realtime diarization + global tracking started")
     print("Press Ctrl+C to stop")
     print("=" * 80)
-
-    last_infer_time = 0.0
 
     with sd.InputStream(
         samplerate=args.sr,
@@ -141,13 +165,20 @@ def main():
                     continue
 
                 wav_rms = compute_rms_np(wav)
+
                 if wav_rms < args.wav_rms_threshold:
+                    tracker_result = None
                     result_json = {
                         "num_speakers": 0,
+                        "num_speakers_stable": 0,
                         "dominant_speaker": None,
+                        "dominant_speaker_slot": None,
+                        "dominant_global_id": None,
                         "activity_ratio": 0.0,
                         "slots": [],
                         "segments": [],
+                        "active_global_ids": [],
+                        "local_to_global": {},
                     }
                 else:
                     wav_tensor = torch.from_numpy(wav).float()
@@ -158,11 +189,22 @@ def main():
                         crop_mode="tail",
                         normalize=True,
                     )
+
+                    tracker_result = tracker.update(result)
+                    result.global_frame_ids = tracker_result.global_frame_ids
+
                     result_json = monitor.to_jsonable(result)
+                    result_json["local_to_global"] = {
+                        int(k): int(v) for k, v in tracker_result.local_to_global.items()
+                    }
+                    result_json["active_global_ids"] = tracker_result.active_global_ids
+                    result_json["dominant_global_id"] = tracker_result.dominant_global_id
+                    result_json["segments"] = segments_with_global_ids(
+                        result, tracker_result.local_to_global
+                    )
 
                 smooth_num_speakers.append(int(result_json["num_speakers"]))
-                stable_num_speakers = majority_vote(list(smooth_num_speakers))
-                result_json["num_speakers_stable"] = stable_num_speakers
+                result_json["num_speakers_stable"] = majority_vote(list(smooth_num_speakers))
 
                 print("\n" + "-" * 80)
                 print(
@@ -170,16 +212,19 @@ def main():
                     f"num_speakers={result_json['num_speakers']} "
                     f"(stable={result_json['num_speakers_stable']}) | "
                     f"dominant_speaker={result_json['dominant_speaker']} | "
+                    f"dominant_global_id={result_json['dominant_global_id']} | "
                     f"activity_ratio={result_json['activity_ratio']:.3f} | "
                     f"wav_rms={wav_rms:.5f}"
                 )
 
-                if len(result_json["slots"]) == 0:
+                if not result_json["slots"]:
                     print("  no active speaker slots")
                 else:
                     for slot in result_json["slots"]:
+                        gid = result_json["local_to_global"].get(int(slot["slot"]), 0)
                         print(
-                            f"  slot={slot['slot']} "
+                            f"  local_slot={slot['slot']} "
+                            f"global_id={gid} "
                             f"name={slot['name']} "
                             f"known={slot['is_known']} "
                             f"dur={slot['duration_sec']:.2f}s "
@@ -187,14 +232,17 @@ def main():
                             f"score={slot['score']}"
                         )
 
+                print(f"  active_global_ids={result_json['active_global_ids']}")
                 print("  segments:")
-                if len(result_json["segments"]) == 0:
+                if not result_json["segments"]:
                     print("    []")
                 else:
                     for seg in result_json["segments"][: args.display_top_segments]:
                         print(
                             f"    [{seg['start_sec']:.2f}s - {seg['end_sec']:.2f}s] "
-                            f"slot={seg['slot']} name={seg['name']}"
+                            f"local_slot={seg['slot']} "
+                            f"global_id={seg['global_id']} "
+                            f"name={seg['name']}"
                         )
 
                 if args.print_json:
