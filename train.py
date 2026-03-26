@@ -1,27 +1,45 @@
-import os
 import json
-from datetime import datetime
-import torch
-from tqdm import tqdm
+import os
 
 import hydra
+import torch
 from omegaconf import DictConfig, OmegaConf
-from utils.utils import *
+
+from speaker_verification.engine.trainer import train_one_epoch
+from speaker_verification.engine.evaluator import validate
+from speaker_verification.engine.checkpoint import save_checkpoint, get_model_state_from_ckpt
+from speaker_verification.factory import build_model, build_loss, build_loaders
+from speaker_verification.logging_utils import setup_logger
+from speaker_verification.utils.seed import set_seed
 
 try:
-    from utils.plot import plot_curves
-    _HAS_PLOT = True
+    from speaker_verification.utils.plot import plot_curves
+    HAS_PLOT = True
 except Exception:
-    _HAS_PLOT = False
+    HAS_PLOT = False
 
-@hydra.main(version_base=None, config_path="configs", config_name="train")
+
+def filter_state_dict(state_dict: dict, exclude_prefixes=None):
+    exclude_prefixes = exclude_prefixes or []
+    return {
+        k: v for k, v in state_dict.items()
+        if not any(k.startswith(prefix) for prefix in exclude_prefixes)
+    }
+
+
+def freeze_backbone_params(model, head_prefixes=None):
+    head_prefixes = head_prefixes or ["diar_head."]
+    for name, param in model.named_parameters():
+        param.requires_grad = any(name.startswith(prefix) for prefix in head_prefixes)
+
+
+@hydra.main(version_base=None, config_path="configs", config_name="experiment")
 def main(cfg: DictConfig):
     os.makedirs(cfg.output.save_dir, exist_ok=True)
     logger, _ = setup_logger(cfg.output.save_dir)
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
     set_seed(cfg.train.seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.train.device == "cuda" else "cpu")
     logger.info("Using device: %s", device)
 
@@ -29,9 +47,28 @@ def main(cfg: DictConfig):
     model = build_model(cfg, device)
     loss_fn = build_loss(cfg, device)
 
+    if cfg.run.mode == "finetune":
+        ckpt = torch.load(cfg.finetune.checkpoint_path, map_location=device)
+        state_dict = get_model_state_from_ckpt(ckpt)
+
+        if cfg.finetune.load_mode == "backbone_only":
+            state_dict = filter_state_dict(state_dict, exclude_prefixes=list(cfg.finetune.head_prefixes))
+
+        load_result = model.load_state_dict(state_dict, strict=cfg.finetune.strict_load)
+        logger.info("Finetune checkpoint loaded from: %s", cfg.finetune.checkpoint_path)
+        logger.info("Missing keys: %s", getattr(load_result, "missing_keys", []))
+        logger.info("Unexpected keys: %s", getattr(load_result, "unexpected_keys", []))
+
+        if cfg.finetune.freeze_backbone:
+            freeze_backbone_params(model, head_prefixes=list(cfg.finetune.head_prefixes))
+
+        actual_lr = cfg.train.lr * cfg.finetune.lr_scale
+    else:
+        actual_lr = cfg.train.lr
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.train.lr,
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=actual_lr,
         weight_decay=cfg.train.weight_decay,
     )
 
@@ -43,7 +80,7 @@ def main(cfg: DictConfig):
             eta_min=cfg.train.min_lr,
         )
 
-    best_metric = float("inf")
+    best_metric = float("inf") if cfg.output.monitor_mode == "min" else float("-inf")
     history = {
         "train_loss": [],
         "train_pit_loss": [],
@@ -88,18 +125,12 @@ def main(cfg: DictConfig):
 
         if scheduler is not None:
             scheduler.step()
-            logger.info(
-                "[Epoch %d] Scheduler stepped | current_lr=%.6e",
-                epoch,
-                optimizer.param_groups[0]["lr"]
-            )
 
         history["train_loss"].append(train_stats["loss"])
         history["train_pit_loss"].append(train_stats["pit_loss"])
         history["train_act_loss"].append(train_stats["act_loss"])
         history["train_cnt_loss"].append(train_stats["cnt_loss"])
         history["train_frm_loss"].append(train_stats["frm_loss"])
-
         history["val_loss"].append(val_stats["val_loss"])
         history["val_pit_loss"].append(val_stats["pit_loss"])
         history["val_act_loss"].append(val_stats["act_loss"])
@@ -109,90 +140,24 @@ def main(cfg: DictConfig):
         history["val_count_acc"].append(val_stats["count_acc"])
         history["val_act_f1"].append(val_stats["act_f1"])
 
-        logger.info(
-            "[Epoch %d] "
-            "TrainLoss=%.4f | TrainPIT=%.4f | TrainACT=%.4f | TrainCNT=%.4f | TrainFRM=%.6f",
-            epoch,
-            train_stats["loss"],
-            train_stats["pit_loss"],
-            train_stats["act_loss"],
-            train_stats["cnt_loss"],
-            train_stats["frm_loss"],
-        )
-
-        logger.info(
-            "[Epoch %d] "
-            "ValLoss=%.4f | PIT=%.4f | ACT=%.4f | CNT=%.4f | FRM=%.6f | "
-            "DER=%.2f%% | CAcc=%.2f%% | ActF1=%.2f%%",
-            epoch,
-            val_stats["val_loss"],
-            val_stats["pit_loss"],
-            val_stats["act_loss"],
-            val_stats["cnt_loss"],
-            val_stats["frm_loss"],
-            val_stats["der"],
-            val_stats["count_acc"] * 100.0,
-            val_stats["act_f1"] * 100.0,
-        )
-
-        logger.info(
-            "[Epoch %d] DER detail | FA=%.2f | MISS=%.2f | CONF=%.2f | GT=%.2f | PRED=%.2f",
-            epoch,
-            val_stats["der_detail"]["fa"],
-            val_stats["der_detail"]["miss"],
-            val_stats["der_detail"]["conf"],
-            val_stats["der_detail"]["gt_active"],
-            val_stats["der_detail"]["pred_active"],
-        )
-
-        save_ckpt(
-            last_ckpt,
-            model,
-            optimizer,
-            scheduler,
-            epoch,
-            best_metric,
-            history,
-            cfg,
-        )
-        logger.info("[Epoch %d] Saved checkpoint: %s", epoch, last_ckpt)
+        save_checkpoint(last_ckpt, model, optimizer, scheduler, epoch, best_metric, history, cfg)
 
         monitor_value = val_stats[cfg.output.monitor]
         improved = monitor_value < best_metric if cfg.output.monitor_mode == "min" else monitor_value > best_metric
-
         if improved:
             best_metric = monitor_value
-            save_ckpt(
-                best_ckpt,
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                best_metric,
-                history,
-                cfg,
-            )
-            logger.info(
-                "[Epoch %d] New best checkpoint saved: %s | %s=%.6f",
-                epoch,
-                best_ckpt,
-                cfg.output.monitor,
-                monitor_value,
-            )
+            save_checkpoint(best_ckpt, model, optimizer, scheduler, epoch, best_metric, history, cfg)
 
         with open(history_json, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
-        logger.info("[Epoch %d] History saved: %s", epoch, history_json)
 
-        if _HAS_PLOT and cfg.output.plot_history:
+        if HAS_PLOT and cfg.output.plot_history:
             try:
                 plot_curves(history, cfg.output.save_dir)
             except Exception as e:
-                logger.warning("[Epoch %d] plot failed: %s", epoch, e)
+                logger.warning("plot failed: %s", e)
 
-    logger.info("=" * 80)
     logger.info("Training finished. Best %s = %.6f", cfg.output.monitor, best_metric)
-    logger.info("Best checkpoint: %s", best_ckpt)
 
 
 if __name__ == "__main__":
