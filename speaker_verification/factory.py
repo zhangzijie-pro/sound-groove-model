@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader
 
 from speaker_verification.models.resowave import ResoWave
 from speaker_verification.loss.multi_task import MultiTaskLoss
-from speaker_verification.dataset.staticdataset import StaticMixDataset
+from speaker_verification.dataset.static_dataset import StaticMixDataset
 
 
 def build_model(cfg, device):

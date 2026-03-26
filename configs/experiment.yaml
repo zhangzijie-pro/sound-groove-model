@@ -42,18 +42,22 @@ validate:
 
 output:
   save_dir: "outputs/default"
-  monitor: "val_loss"
-  monitor_mode: "min"
+  monitor: "val_loss"      # 例如 val_loss / der / act_f1
+  monitor_mode: "min"      # min | max
   plot_history: true
 
 finetune:
   checkpoint_path: ""
-  load_mode: "full"       # full | backbone_only
+  load_mode: "full"        # full | backbone_only
   strict_load: true
   head_prefixes:
     - "diar_head."
   freeze_backbone: false
   lr_scale: 0.1
+
+resume:
+  enabled: false
+  checkpoint_path: ""
 
 hydra:
   run:

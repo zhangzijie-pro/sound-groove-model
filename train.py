@@ -1,5 +1,6 @@
 import json
 import os
+from typing import Dict, Any, Optional
 
 import hydra
 import torch
@@ -7,7 +8,10 @@ from omegaconf import DictConfig, OmegaConf
 
 from speaker_verification.engine.trainer import train_one_epoch
 from speaker_verification.engine.evaluator import validate
-from speaker_verification.engine.checkpoint import save_checkpoint, get_model_state_from_ckpt
+from speaker_verification.engine.checkpoint import (
+    save_checkpoint,
+    get_model_state_from_ckpt,
+)
 from speaker_verification.factory import build_model, build_loss, build_loaders
 from speaker_verification.logging_utils import setup_logger
 from speaker_verification.utils.seed import set_seed
@@ -19,10 +23,11 @@ except Exception:
     HAS_PLOT = False
 
 
-def filter_state_dict(state_dict: dict, exclude_prefixes=None):
+def filter_state_dict(state_dict: Dict[str, torch.Tensor], exclude_prefixes=None):
     exclude_prefixes = exclude_prefixes or []
     return {
-        k: v for k, v in state_dict.items()
+        k: v
+        for k, v in state_dict.items()
         if not any(k.startswith(prefix) for prefix in exclude_prefixes)
     }
 
@@ -33,55 +38,14 @@ def freeze_backbone_params(model, head_prefixes=None):
         param.requires_grad = any(name.startswith(prefix) for prefix in head_prefixes)
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="experiment")
-def main(cfg: DictConfig):
-    os.makedirs(cfg.output.save_dir, exist_ok=True)
-    logger, _ = setup_logger(cfg.output.save_dir)
-    logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
-    set_seed(cfg.train.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg.train.device == "cuda" else "cpu")
-    logger.info("Using device: %s", device)
 
-    train_loader, val_loader = build_loaders(cfg, device)
-    model = build_model(cfg, device)
-    loss_fn = build_loss(cfg, device)
-
-    if cfg.run.mode == "finetune":
-        ckpt = torch.load(cfg.finetune.checkpoint_path, map_location=device)
-        state_dict = get_model_state_from_ckpt(ckpt)
-
-        if cfg.finetune.load_mode == "backbone_only":
-            state_dict = filter_state_dict(state_dict, exclude_prefixes=list(cfg.finetune.head_prefixes))
-
-        load_result = model.load_state_dict(state_dict, strict=cfg.finetune.strict_load)
-        logger.info("Finetune checkpoint loaded from: %s", cfg.finetune.checkpoint_path)
-        logger.info("Missing keys: %s", getattr(load_result, "missing_keys", []))
-        logger.info("Unexpected keys: %s", getattr(load_result, "unexpected_keys", []))
-
-        if cfg.finetune.freeze_backbone:
-            freeze_backbone_params(model, head_prefixes=list(cfg.finetune.head_prefixes))
-
-        actual_lr = cfg.train.lr * cfg.finetune.lr_scale
-    else:
-        actual_lr = cfg.train.lr
-
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=actual_lr,
-        weight_decay=cfg.train.weight_decay,
-    )
-
-    scheduler = None
-    if cfg.train.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=cfg.train.epochs,
-            eta_min=cfg.train.min_lr,
-        )
-
-    best_metric = float("inf") if cfg.output.monitor_mode == "min" else float("-inf")
-    history = {
+def build_history() -> Dict[str, list]:
+    return {
         "train_loss": [],
         "train_pit_loss": [],
         "train_act_loss": [],
@@ -97,11 +61,190 @@ def main(cfg: DictConfig):
         "val_act_f1": [],
     }
 
+
+def append_history(history: Dict[str, list], train_stats: Dict[str, float], val_stats: Dict[str, float]):
+    history["train_loss"].append(train_stats["loss"])
+    history["train_pit_loss"].append(train_stats["pit_loss"])
+    history["train_act_loss"].append(train_stats["act_loss"])
+    history["train_cnt_loss"].append(train_stats["cnt_loss"])
+    history["train_frm_loss"].append(train_stats["frm_loss"])
+
+    history["val_loss"].append(val_stats["val_loss"])
+    history["val_pit_loss"].append(val_stats["pit_loss"])
+    history["val_act_loss"].append(val_stats["act_loss"])
+    history["val_cnt_loss"].append(val_stats["cnt_loss"])
+    history["val_frm_loss"].append(val_stats["frm_loss"])
+    history["val_der"].append(val_stats["der"])
+    history["val_count_acc"].append(val_stats["count_acc"])
+    history["val_act_f1"].append(val_stats["act_f1"])
+
+
+def log_epoch_stats(logger, epoch: int, train_stats: Dict[str, float], val_stats: Dict[str, float], lr: float):
+    logger.info(
+        "[Epoch %d] LR=%.6e | "
+        "TrainLoss=%.4f | TrainPIT=%.4f | TrainACT=%.4f | TrainCNT=%.4f | TrainFRM=%.6f",
+        epoch,
+        lr,
+        train_stats["loss"],
+        train_stats["pit_loss"],
+        train_stats["act_loss"],
+        train_stats["cnt_loss"],
+        train_stats["frm_loss"],
+    )
+
+    logger.info(
+        "[Epoch %d] "
+        "ValLoss=%.4f | PIT=%.4f | ACT=%.4f | CNT=%.4f | FRM=%.6f | "
+        "DER=%.2f%% | CAcc=%.2f%% | ActF1=%.2f%%",
+        epoch,
+        val_stats["val_loss"],
+        val_stats["pit_loss"],
+        val_stats["act_loss"],
+        val_stats["cnt_loss"],
+        val_stats["frm_loss"],
+        val_stats["der"],
+        val_stats["count_acc"] * 100.0,
+        val_stats["act_f1"] * 100.0,
+    )
+
+    logger.info(
+        "[Epoch %d] DER detail | FA=%.2f | MISS=%.2f | CONF=%.2f | GT=%.2f | PRED=%.2f",
+        epoch,
+        val_stats["der_detail"]["fa"],
+        val_stats["der_detail"]["miss"],
+        val_stats["der_detail"]["conf"],
+        val_stats["der_detail"]["gt_active"],
+        val_stats["der_detail"]["pred_active"],
+    )
+
+
+def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
+    """
+    返回实际学习率倍率后的 lr
+    """
+    if cfg.run.mode != "finetune":
+        return float(cfg.train.lr)
+
+    ckpt_path = cfg.finetune.checkpoint_path
+    if not ckpt_path:
+        raise ValueError("run.mode=finetune but finetune.checkpoint_path is empty")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Finetune checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state_dict = get_model_state_from_ckpt(ckpt)
+
+    if cfg.finetune.load_mode == "backbone_only":
+        state_dict = filter_state_dict(
+            state_dict,
+            exclude_prefixes=list(cfg.finetune.head_prefixes),
+        )
+    elif cfg.finetune.load_mode != "full":
+        raise ValueError(f"Unsupported finetune.load_mode: {cfg.finetune.load_mode}")
+
+    load_result = model.load_state_dict(state_dict, strict=cfg.finetune.strict_load)
+    logger.info("Finetune checkpoint loaded from: %s", ckpt_path)
+    logger.info("Missing keys: %s", getattr(load_result, "missing_keys", []))
+    logger.info("Unexpected keys: %s", getattr(load_result, "unexpected_keys", []))
+
+    if cfg.finetune.freeze_backbone:
+        freeze_backbone_params(model, head_prefixes=list(cfg.finetune.head_prefixes))
+        logger.info("Backbone frozen. Train only head prefixes: %s", list(cfg.finetune.head_prefixes))
+    else:
+        logger.info("Backbone not frozen.")
+
+    return float(cfg.train.lr) * float(cfg.finetune.lr_scale)
+
+
+def maybe_resume_training(cfg, model, optimizer, scheduler, device, logger):
+    """
+    恢复完整训练状态:
+    - model
+    - optimizer
+    - scheduler
+    - epoch
+    - best_metric
+    - history
+    """
+    if not cfg.resume.enabled:
+        return 1, (float("inf") if cfg.output.monitor_mode == "min" else float("-inf")), build_history()
+
+    ckpt_path = cfg.resume.checkpoint_path
+    if not ckpt_path:
+        raise ValueError("resume.enabled=true but resume.checkpoint_path is empty")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    model.load_state_dict(get_model_state_from_ckpt(ckpt), strict=True)
+
+    if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+
+    if scheduler is not None and "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best_metric = ckpt.get(
+        "best_metric",
+        float("inf") if cfg.output.monitor_mode == "min" else float("-inf"),
+    )
+    history = ckpt.get("history", build_history())
+
+    logger.info("Resume checkpoint loaded from: %s", ckpt_path)
+    logger.info("Resume start epoch: %d", start_epoch)
+    logger.info("Resume best_metric: %s", str(best_metric))
+
+    return start_epoch, best_metric, history
+
+
+@hydra.main(version_base=None, config_path="configs", config_name="experiment")
+def main(cfg: DictConfig):
+    os.makedirs(cfg.output.save_dir, exist_ok=True)
+    logger, _ = setup_logger(cfg.output.save_dir)
+    logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
+
+    set_seed(cfg.train.seed)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and cfg.train.device == "cuda" else "cpu"
+    )
+    logger.info("Using device: %s", device)
+
+    train_loader, val_loader = build_loaders(cfg, device)
+    model = build_model(cfg, device)
+    loss_fn = build_loss(cfg, device)
+
+    actual_lr = maybe_load_finetune_weights(cfg, model, device, logger)
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=actual_lr,
+        weight_decay=cfg.train.weight_decay,
+    )
+
+    scheduler = None
+    if cfg.train.use_scheduler:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.train.epochs,
+            eta_min=cfg.train.min_lr,
+        )
+
+    start_epoch, best_metric, history = maybe_resume_training(
+        cfg, model, optimizer, scheduler, device, logger
+    )
+
+    total_params, trainable_params = count_parameters(model)
+    logger.info("Model params | total=%d | trainable=%d", total_params, trainable_params)
+    logger.info("Actual LR: %.6e", actual_lr)
+
     last_ckpt = os.path.join(cfg.output.save_dir, "last.pt")
     best_ckpt = os.path.join(cfg.output.save_dir, "best.pt")
     history_json = os.path.join(cfg.output.save_dir, "history.json")
 
-    for epoch in range(1, cfg.train.epochs + 1):
+    for epoch in range(start_epoch, cfg.train.epochs + 1):
         logger.info("=" * 80)
         logger.info("Epoch %d/%d started", epoch, cfg.train.epochs)
 
@@ -126,27 +269,48 @@ def main(cfg: DictConfig):
         if scheduler is not None:
             scheduler.step()
 
-        history["train_loss"].append(train_stats["loss"])
-        history["train_pit_loss"].append(train_stats["pit_loss"])
-        history["train_act_loss"].append(train_stats["act_loss"])
-        history["train_cnt_loss"].append(train_stats["cnt_loss"])
-        history["train_frm_loss"].append(train_stats["frm_loss"])
-        history["val_loss"].append(val_stats["val_loss"])
-        history["val_pit_loss"].append(val_stats["pit_loss"])
-        history["val_act_loss"].append(val_stats["act_loss"])
-        history["val_cnt_loss"].append(val_stats["cnt_loss"])
-        history["val_frm_loss"].append(val_stats["frm_loss"])
-        history["val_der"].append(val_stats["der"])
-        history["val_count_acc"].append(val_stats["count_acc"])
-        history["val_act_f1"].append(val_stats["act_f1"])
+        append_history(history, train_stats, val_stats)
 
-        save_checkpoint(last_ckpt, model, optimizer, scheduler, epoch, best_metric, history, cfg)
+        current_lr = optimizer.param_groups[0]["lr"]
+        log_epoch_stats(logger, epoch, train_stats, val_stats, current_lr)
+
+        save_checkpoint(
+            last_ckpt,
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            best_metric,
+            history,
+            cfg,
+        )
 
         monitor_value = val_stats[cfg.output.monitor]
-        improved = monitor_value < best_metric if cfg.output.monitor_mode == "min" else monitor_value > best_metric
+        improved = (
+            monitor_value < best_metric
+            if cfg.output.monitor_mode == "min"
+            else monitor_value > best_metric
+        )
+
         if improved:
             best_metric = monitor_value
-            save_checkpoint(best_ckpt, model, optimizer, scheduler, epoch, best_metric, history, cfg)
+            save_checkpoint(
+                best_ckpt,
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                best_metric,
+                history,
+                cfg,
+            )
+            logger.info(
+                "[Epoch %d] New best checkpoint saved: %s | %s=%.6f",
+                epoch,
+                best_ckpt,
+                cfg.output.monitor,
+                monitor_value,
+            )
 
         with open(history_json, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
@@ -157,7 +321,9 @@ def main(cfg: DictConfig):
             except Exception as e:
                 logger.warning("plot failed: %s", e)
 
+    logger.info("=" * 80)
     logger.info("Training finished. Best %s = %.6f", cfg.output.monitor, best_metric)
+    logger.info("Best checkpoint: %s", best_ckpt)
 
 
 if __name__ == "__main__":
