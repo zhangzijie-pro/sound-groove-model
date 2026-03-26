@@ -10,12 +10,14 @@
   ![Task](https://img.shields.io/badge/Task-Speaker%20Verification-green)
 
 </div>
-
 <div align="center">
   <a href="Readme_ch.md">中文文档</a> • 
   <a href="https://github.com/zhangzijie-pro/Speaker-Verification">GitHub</a> • 
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
+
+![WT-EPA-WRR-REAT Model](imgs/model.jpg)
+
 
 **PyTorch** implementation of a **speaker-aware** multi-speaker audio model, focused on advanced speaker diarization and verification tasks.
 

@@ -18,6 +18,8 @@
   <a href="https://huggingface.co/zzj-pro">Hugging Face</a>
 </div>
 
+![WT-EPA-WRR-REAT Model](imgs/model.jpg)
+
 **PyTorch** 实现的 **说话人感知（Speaker-Aware）** 多说话人音频模型，专注于先进的说话人分离（Diarization）与验证任务。
 
 本仓库支持以下功能：
