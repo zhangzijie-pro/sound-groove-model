@@ -85,10 +85,28 @@ class ResoWave(nn.Module):
         self,
         in_channels=80,
         channels=512,
-        embd_dim=192,
+        embedding_dim=192,
         max_mix_speakers=5,
+        **kwargs,
     ):
         super().__init__()
+        legacy_embedding_dim = kwargs.pop("embd_dim", None)
+        alias_embedding_dim = kwargs.pop("emb_dim", None)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword arguments: {unexpected}")
+
+        if legacy_embedding_dim is not None and embedding_dim != 192:
+            raise TypeError("Use only one of `embedding_dim`, `emb_dim`, or `embd_dim`.")
+        if alias_embedding_dim is not None and embedding_dim != 192:
+            raise TypeError("Use only one of `embedding_dim`, `emb_dim`, or `embd_dim`.")
+
+        if legacy_embedding_dim is not None:
+            embedding_dim = legacy_embedding_dim
+        if alias_embedding_dim is not None:
+            embedding_dim = alias_embedding_dim
+
+        embedding_dim = int(embedding_dim)
         self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)
         self.layer2 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=2, dilation=2, scale=8)
         self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
@@ -97,12 +115,12 @@ class ResoWave(nn.Module):
         self.conv = nn.Conv1d(channels * 3, 1536, kernel_size=1)
         self.pooling = AttentiveStatsPool(1536, 128)
         self.bn1 = nn.BatchNorm1d(3072)
-        self.linear = nn.Linear(3072, embd_dim)
-        self.bn2 = nn.BatchNorm1d(embd_dim)
+        self.linear = nn.Linear(3072, embedding_dim)
+        self.bn2 = nn.BatchNorm1d(embedding_dim)
 
         self.diar_head = REAT_DiarizationHead(
             in_dim=channels,
-            emb_dim=embd_dim,
+            emb_dim=embedding_dim,
             num_speakers_max=max_mix_speakers,
         )
 
@@ -131,38 +149,3 @@ class ResoWave(nn.Module):
             return emb, frame_embeds, slot_logits, activity_logits, count_logits
 
         return emb
-
-# class ResoWave(nn.Module):
-#     def __init__(
-#         self,
-#         in_channels=80,
-#         channels=512,
-#         embd_dim=192,
-#         max_mix_speakers=5,
-#     ):
-#         super().__init__()
-#         self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)
-#         self.layer2 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=2, dilation=2, scale=8)
-#         self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
-#         self.layer4 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
-
-#         self.diar_head = REAT_DiarizationHead(
-#             in_dim=channels,
-#             emb_dim=embd_dim,
-#             num_speakers_max=max_mix_speakers,
-#         )
-
-#     def forward(self, x):
-#         """
-#         x: [B,T,80]
-#         """
-#         x = x.transpose(1, 2)  # [B,80,T]
-
-#         out1 = self.layer1(x)
-#         out2 = self.layer2(out1)
-#         out3 = self.layer3(out1 + out2)
-#         out4 = self.layer4(out1 + out2 + out3)  # [B,512,T]
-
-#         frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
-#         frame_embeds, slot_logits, activity_logits, count_logits = self.diar_head(frame_feat)
-#         return frame_embeds, slot_logits, activity_logits, count_logits

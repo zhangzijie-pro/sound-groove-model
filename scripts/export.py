@@ -86,7 +86,7 @@ class ModelExporter:
         with open(self.out_dir / "meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    def spilt_single_head(self, ckpt_path, out_path):
+    def split_single_head(self, ckpt_path, out_dir):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
 
         full_state_dict = ckpt["model_state"]
@@ -109,7 +109,7 @@ class ModelExporter:
 
         print(f"Missing : {missing}, unexpected: {unexpected}")
 
-        out_ckpt_path = os.path.join(out_path, "resowave_clear.pt")
+        out_ckpt_path = os.path.join(out_dir, "resowave_clear.pt")
 
         torch.save({
             'model_state_dict': diar_model.state_dict()
@@ -186,13 +186,13 @@ def main():
     parser.add_argument("--out_dir", type=str, default="outputs/export",
                         help="导出目录 (默认: outputs/export)")
     
-    parser.add_argument("--split", action="store_true", default=True,
+    parser.add_argument("--split", action=argparse.BooleanOptionalAction, default=True,
                         help="是否拆分 checkpoint (默认: True)")
     
-    parser.add_argument("--split_pithy", default=False,
+    parser.add_argument("--split_pithy", action="store_true", default=False,
                         help="是否拆分 checkpoint 为简洁版 (默认: False)")
     
-    parser.add_argument("--onnx", action="store_true", default=True,
+    parser.add_argument("--onnx", action=argparse.BooleanOptionalAction, default=True,
                         help="是否导出 ONNX (默认: True)")
     
     parser.add_argument("--mnn", action="store_true", default=False,
@@ -207,7 +207,7 @@ def main():
     parser.add_argument("--opset", type=int, default=17,
                         help="ONNX opset version")
     
-    parser.add_argument("--fp16", action="store_true", default=True,
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
                         help="MNN 使用 FP16")
 
     args = parser.parse_args()
@@ -218,7 +218,7 @@ def main():
         exporter.split_checkpoint()
 
     if args.split_pithy:
-        exporter.spilt_single_head(ckpt_path=args.ckpt, out_dir=args.out_dir)
+        exporter.split_single_head(ckpt_path=args.ckpt, out_dir=args.out_dir)
 
     if args.onnx:
         exporter.export_onnx(
