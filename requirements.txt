@@ -10,4 +10,5 @@ omegaconf
 wandb
 onnxruntime
 PyWavelets
+scipy
 sounddevice
