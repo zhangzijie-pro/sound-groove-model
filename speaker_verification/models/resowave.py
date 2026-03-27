@@ -23,7 +23,10 @@ class Res2Conv1dReluBn(nn.Module):
         out = []
         spx = torch.split(x, self.width, 1)
         for i in range(self.nums):
-            sp = spx[i] if i == 0 else (sp + spx[i])
+            if i == 0:
+                sp = spx[i]
+            else:
+                sp = sp + spx[i]
             sp = self.convs[i](sp)
             sp = self.bns[i](F.relu(sp))
             out.append(sp)
