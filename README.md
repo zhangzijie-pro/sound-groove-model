@@ -8,7 +8,6 @@
   ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
   [![PyPI](https://img.shields.io/pypi/v/speaker-verification)](https://pypi.org/project/speaker-verification/)
   [![CI](https://img.shields.io/github/actions/workflow/status/zhangzijie-pro/Speaker-Verification/ci.yml?branch=main&label=CI)](https://github.com/zhangzijie-pro/Speaker-Verification/actions)
-  [![Coverage](https://img.shields.io/badge/coverage-%E2%89%A575%25-brightgreen)](./pytest.ini)
 </div>
 
 <div align="center">
