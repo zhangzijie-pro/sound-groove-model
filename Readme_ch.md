@@ -16,8 +16,6 @@
   <a href="./CONTRIBUTING.md">贡献指南</a>
 </div>
 
-![WT-EPA-WRR-REAT Model](docs/imgs/model.jpg)
-
 ## 🚀 核心
 
 - `ResoWave` + `REAT`：联合建模 activity、slot assignment、speaker count 和 frame prototype

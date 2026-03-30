@@ -17,7 +17,6 @@
   <a href="./CONTRIBUTING.md">Contributing</a>
 </div>
 
-![WT-EPA-WRR-REAT Model](docs/imgs/model.jpg)
 
 ## 🚀 Showcase
 
