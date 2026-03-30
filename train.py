@@ -15,6 +15,8 @@ from speaker_verification.engine.checkpoint import (
 from speaker_verification.factory import build_model, build_loss, build_loaders
 from speaker_verification.logging_utils import setup_logger
 from speaker_verification.utils.seed import set_seed
+from speaker_verification.quantization.turboquant import build_turboquant
+
 
 try:
     from speaker_verification.utils.plot import plot_curves
@@ -117,11 +119,15 @@ def log_epoch_stats(logger, epoch: int, train_stats: Dict[str, float], val_stats
         val_stats["der_detail"]["pred_active"],
     )
 
+    if val_stats.get("proto_cos_q", None) is not None:
+        logger.info(
+            "[Epoch %d] QuantCheck | ProtoCosQ=%.4f | TrackerUpdatesQ=%d",
+            epoch,
+            val_stats["proto_cos_q"],
+            int(val_stats.get("tracker_updates_q", 0)),
+        )
 
 def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
-    """
-    返回实际学习率倍率后的 lr
-    """
     if cfg.run.mode != "finetune":
         return float(cfg.train.lr)
 
@@ -157,15 +163,6 @@ def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
 
 
 def maybe_resume_training(cfg, model, optimizer, scheduler, device, logger):
-    """
-    恢复完整训练状态:
-    - model
-    - optimizer
-    - scheduler
-    - epoch
-    - best_metric
-    - history
-    """
     if not cfg.resume.enabled:
         return 1, (float("inf") if cfg.output.monitor_mode == "min" else float("-inf")), build_history()
 
@@ -215,6 +212,28 @@ def main(cfg: DictConfig):
     train_loader, val_loader = build_loaders(cfg, device)
     model = build_model(cfg, device)
     loss_fn = build_loss(cfg, device)
+    frame_quantizer = None
+    tracker_quantizer = None
+
+    if getattr(cfg, "quant", None) is not None and cfg.quant.enable:
+        frame_quantizer = build_turboquant(
+            mode=cfg.quant.mode,
+            dim=int(cfg.model.embedding_dim),
+            bits=int(cfg.quant.bits),
+            clip_sigma=float(cfg.quant.clip_sigma),
+            device=str(device),
+            seed=int(cfg.quant.seed),
+        )
+
+        if cfg.quant.apply_tracker_quant:
+            tracker_quantizer = build_turboquant(
+                mode=cfg.quant.mode,
+                dim=int(cfg.model.embedding_dim),
+                bits=int(cfg.quant.bits),
+                clip_sigma=float(cfg.quant.clip_sigma),
+                device=str(device),
+                seed=int(cfg.quant.seed) + 99,
+            )
 
     actual_lr = maybe_load_finetune_weights(cfg, model, device, logger)
 
@@ -264,6 +283,9 @@ def main(cfg: DictConfig):
             device=device,
             max_batches=cfg.validate.max_batches,
             activity_threshold=cfg.validate.activity_threshold,
+            frame_quantizer=frame_quantizer if cfg.quant.apply_frame_quant_in_validate else None,
+            tracker_quantizer=tracker_quantizer if cfg.quant.apply_tracker_quant else None,
+            run_quant_tracker=bool(cfg.quant.run_tracker_in_validate),
         )
 
         if scheduler is not None:

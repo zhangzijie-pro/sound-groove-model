@@ -8,12 +8,14 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from speaker_verification.interfaces.diar_interface import ChunkInferenceResult
+from speaker_verification.quantization.turboquant import QuantizedTensorState
 
 
 @dataclass
 class Track:
     global_id: int
-    prototype: torch.Tensor
+    prototype: Optional[torch.Tensor] = None
+    prototype_q: Optional[QuantizedTensorState] = None
     hits: int = 1
     misses: int = 0
 
@@ -33,11 +35,14 @@ class GlobalSpeakerTracker:
         momentum: float = 0.9,
         max_misses: int = 30,
         device: str = "cpu",
+        quantizer = None
     ):
         self.match_threshold = float(match_threshold)
         self.momentum = float(momentum)
         self.max_misses = int(max_misses)
         self.device = torch.device(device)
+        self.quantizer = quantizer
+        
         self.tracks: Dict[int, Track] = {}
         self.next_global_id = 1
 
@@ -55,20 +60,47 @@ class GlobalSpeakerTracker:
         b = F.normalize(b, p=2, dim=-1)
         return a @ b.t()
 
-    def _new_track(self, proto: torch.Tensor) -> int:
+    def _encode_proto(self, proto: torch.Tensor) -> tuple[Optional[torch.Tensor], Optional[QuantizedTensorState]]:
+        proto = self._norm(proto.detach().to(self.device))
+        if self.quantizer is not None:
+            return proto, None
+        qstate = self.quantizer.quantize(proto)
+        return None, qstate
+    
+    def _decode_proto(self, track: Track) -> torch.Tensor:
+        if track.prototype_q is not None:
+            proto = self.quantizer.dequantize(track.prototype_q)
+            return self._norm(proto.detach().to(self.device))
+        if track.prototype is None:
+            raise ValueError("Track has neither prototype nor prototype_q")
+        return self._norm(track.prototype.detach().to(self.device))
+        
+    def _new_track(self, proto:torch.Tensor) -> int:
         gid = self.next_global_id
         self.next_global_id += 1
-        self.tracks[gid] = Track(global_id=gid, prototype=self._norm(proto.detach().to(self.device)))
+        proto_fp, proto_q = self._encode_proto(proto)
+        self.tracks[gid] = Track(
+            global_id=gid,
+            prototype=proto_fp,
+            prototype_q=proto_q,
+            hits=1,
+            misses=0
+        )
         return gid
-
-    def _update_track(self, gid: int, proto: torch.Tensor):
+    
+    def _update_track(self, gid: int, proto:torch.Tensor):
         cur = self._norm(proto.detach().to(self.device))
-        old = self.tracks[gid].prototype
+        old = self._decode_proto(self.tracks[gid])
+        
         new = self._norm(self.momentum * old + (1.0 - self.momentum) * cur)
-        self.tracks[gid].prototype = new
+        proto_fp, proto_q = self._encode_proto(new)
+        
+        self.tracks[gid].prototype = proto_fp
+        self.tracks[gid].prototype_q = proto_q
         self.tracks[gid].hits += 1
         self.tracks[gid].misses = 0
-
+        
+    
     def _age_unmatched(self, matched_gids: set[int]):
         dead = []
         for gid, track in self.tracks.items():
@@ -78,7 +110,8 @@ class GlobalSpeakerTracker:
                     dead.append(gid)
         for gid in dead:
             del self.tracks[gid]
-
+        
+        
     @staticmethod
     def _build_global_frame_ids(
         local_frame_ids: torch.Tensor,
@@ -116,7 +149,6 @@ class GlobalSpeakerTracker:
             row_ind, col_ind = linear_sum_assignment((1.0 - sim).detach().cpu().numpy())
 
             matched_local_idx = set()
-            matched_bank_idx = set()
 
             for r, c in zip(row_ind.tolist(), col_ind.tolist()):
                 score = float(sim[r, c].item())
@@ -127,7 +159,6 @@ class GlobalSpeakerTracker:
                 local_to_global[local_ids[r]] = gid
                 matched_gids.add(gid)
                 matched_local_idx.add(r)
-                matched_bank_idx.add(c)
 
             for i, slot in enumerate(result.slots):
                 if i in matched_local_idx:
