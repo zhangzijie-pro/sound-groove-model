@@ -18,6 +18,9 @@ try:
 except ImportError:
     torchaudio = None
 
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from speaker_verification.audio.features import wav_to_fbank, load_wav_mono
 
 def set_seed(seed: int):
@@ -119,8 +122,8 @@ class BuildCfg:
 
     # static mix
     static_out_dir: str = "../processed/static_mix_cnceleb2"
-    num_train_mixes: int = 100000
-    num_val_mixes: int = 10000
+    num_train_mixes: int = 10000
+    num_val_mixes: int = 1000
     min_mix: int = 2
     max_mix: int = 4
     crop_sec: float = 4.0
@@ -134,14 +137,14 @@ class BuildCfg:
     max_offset_ratio: float = 0.35
 
     # add single
-    add_single_train: int = 4000
+    add_single_train: int = 3000
     add_single_val: int = 500
     add_single_subdir: str = "single_from_cnceleb2"
     backup_manifest: bool = True
     skip_existing: bool = True
 
     # add negative
-    add_neg_train: int = 4000
+    add_neg_train: int = 2000
     add_neg_val: int = 500
     add_neg_subdir: str = "neg_augmented"
 
@@ -401,8 +404,12 @@ def generate_mix_split(
 def build_static_mix(cfg: BuildCfg):
     set_seed(cfg.seed)
 
-    train_map_path = os.path.join(cfg.cn_out_dir, "spk_to_utterances_train.json")
-    val_map_path = os.path.join(cfg.cn_out_dir, "spk_to_utterances_val.json")
+    train_map_path_aug = os.path.join(cfg.cn_out_dir, "spk_to_utterances_train_aug.json")
+    val_map_path_aug = os.path.join(cfg.cn_out_dir, "spk_to_utterances_val_aug.json")
+
+    train_map_path = train_map_path_aug if os.path.isfile(train_map_path_aug) else os.path.join(cfg.cn_out_dir, "spk_to_utterances_train.json")
+    val_map_path = val_map_path_aug if os.path.isfile(val_map_path_aug) else os.path.join(cfg.cn_out_dir, "spk_to_utterances_val.json")
+
     spk2id_path = os.path.join(cfg.cn_out_dir, "spk2id.json")
 
     if not os.path.isfile(train_map_path):
@@ -786,7 +793,7 @@ def parse_args():
     parser.add_argument("--min_utts_per_spk", type=int, default=2)
 
     parser.add_argument("--num_train_mixes", type=int, default=100000)
-    parser.add_argument("--num_val_mixes", type=int, default=10000)
+    parser.add_argument("--num_val_mixes", type=int, default=20000)
     parser.add_argument("--min_mix", type=int, default=2)
     parser.add_argument("--max_mix", type=int, default=4)
     parser.add_argument("--crop_sec", type=float, default=4.0)
@@ -799,7 +806,7 @@ def parse_args():
     parser.add_argument("--allow_overlap", action="store_true")
     parser.add_argument("--max_offset_ratio", type=float, default=0.35)
 
-    parser.add_argument("--add_single_train", type=int, default=4000)
+    parser.add_argument("--add_single_train", type=int, default=3000)
     parser.add_argument("--add_single_val", type=int, default=500)
     parser.add_argument("--add_neg_train", type=int, default=4000)
     parser.add_argument("--add_neg_val", type=int, default=500)
