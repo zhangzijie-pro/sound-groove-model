@@ -4,10 +4,11 @@ import math
 import random
 import shutil
 import argparse
+from datetime import datetime
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -28,8 +29,8 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
 
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+def ensure_dir(path: str | Path):
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: str):
@@ -71,13 +72,85 @@ def append_jsonl(path: str, items: List[dict]):
             f.write(json.dumps(x, ensure_ascii=False) + "\n")
 
 
-def backup_file(path: str):
+def dedupe_preserve_order(items: Iterable[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, (dict, list)) else item
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def load_txt_pairs(path: str) -> List[Tuple[int, str]]:
+    items: List[Tuple[int, str]] = []
     if not os.path.isfile(path):
+        return items
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            sp = s.split(maxsplit=1)
+            if len(sp) != 2:
+                continue
+            items.append((int(sp[0]), sp[1]))
+    return items
+
+
+def save_txt_pairs(path: str, items: List[Tuple[int, str]]):
+    ensure_dir(Path(path).parent)
+    with open(path, "w", encoding="utf-8") as f:
+        for spk_id, p in items:
+            f.write(f"{spk_id} {p}\n")
+
+
+def normalize_path(path: str | Path) -> str:
+    return str(Path(path)).replace("\\", "/")
+
+
+def copy_to_backup(path: str | Path, backup_root: str | Path, relative_to: str | Path):
+    src = Path(path)
+    if not src.is_file():
         return
-    bak = path + ".bak"
-    if not os.path.isfile(bak):
-        shutil.copy2(path, bak)
-        print(f"[Backup] {path} -> {bak}")
+    rel = src.relative_to(relative_to)
+    dst = Path(backup_root) / rel
+    ensure_dir(dst.parent)
+    if dst.exists():
+        return
+    shutil.copy2(src, dst)
+    print(f"[Backup] {src} -> {dst}")
+
+
+def backup_files(paths: Iterable[str | Path], output_root: str | Path, backup_dir_name: str, backup_tag: str):
+    backup_root = Path(output_root) / backup_dir_name / backup_tag
+    for path in paths:
+        copy_to_backup(path, backup_root, output_root)
+
+
+def next_available_index(out_dir: str | Path, prefix: str, suffix: str = ".pt") -> int:
+    root = Path(out_dir)
+    if not root.is_dir():
+        return 0
+    max_idx = -1
+    for path in root.glob(f"{prefix}*{suffix}"):
+        stem = path.stem
+        parts = stem.split("_")
+        for token in parts:
+            if token.isdigit():
+                max_idx = max(max_idx, int(token))
+                break
+    return max_idx + 1
+
+
+def backup_metadata_files(cfg: "BuildCfg", output_root: str, paths: Iterable[str | Path]):
+    if not cfg.backup_manifest:
+        return
+    if not cfg.backup_tag:
+        cfg.backup_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_files(paths, output_root=output_root, backup_dir_name=cfg.backup_dir_name, backup_tag=cfg.backup_tag)
 
 
 def safe_key(path: str, root: str) -> str:
@@ -106,10 +179,14 @@ def list_pt_files(root: str) -> List[str]:
 @dataclass
 class BuildCfg:
     # stage
-    stage: str = "all"  # cn | mix | add_single | add_negative | all
+    stage: str = "all"  # cn | augment_cn | mix | add_single | add_negative | all
 
     # common
     seed: int = 1234
+    incremental: bool = True
+    backup_manifest: bool = True
+    backup_dir_name: str = "_backups"
+    backup_tag: str = ""
 
     # CN-Celeb2 preprocess
     cn_root: str = "../CN-Celeb_flac"
@@ -140,13 +217,18 @@ class BuildCfg:
     add_single_train: int = 3000
     add_single_val: int = 500
     add_single_subdir: str = "single_from_cnceleb2"
-    backup_manifest: bool = True
     skip_existing: bool = True
 
     # add negative
     add_neg_train: int = 2000
     add_neg_val: int = 500
     add_neg_subdir: str = "neg_augmented"
+
+    # augmentation
+    num_aug_per_utt_train: int = 4
+    num_aug_per_utt_val: int = 1
+    aug_subdir: str = "fbank_pt_aug"
+    augmentation_version: str = "v2"
 
 
 # =========================================================
@@ -155,98 +237,364 @@ class BuildCfg:
 def preprocess_cn_celeb2(cfg: BuildCfg):
     set_seed(cfg.seed)
 
-    ensure_dir(cfg.cn_out_dir)
-    feat_dir = os.path.join(cfg.cn_out_dir, "fbank_pt")
+    cn_out_dir = Path(cfg.cn_out_dir)
+    ensure_dir(cn_out_dir)
+    feat_dir = cn_out_dir / "fbank_pt"
     ensure_dir(feat_dir)
 
-    data_dir = os.path.join(cfg.cn_root, "data")
-    if not os.path.isdir(data_dir):
+    data_dir = Path(cfg.cn_root) / "data"
+    if not data_dir.is_dir():
         raise FileNotFoundError(f"Missing data dir: {data_dir}")
 
     spk2files = defaultdict(list)
-    for spk in os.listdir(data_dir):
-        spk_path = os.path.join(data_dir, spk)
-        if not os.path.isdir(spk_path):
+    for spk in sorted(os.listdir(data_dir)):
+        spk_path = data_dir / spk
+        if not spk_path.is_dir():
             continue
-        for fn in os.listdir(spk_path):
+        for fn in sorted(os.listdir(spk_path)):
             if fn.lower().endswith((".flac", ".wav")):
-                spk2files[spk].append(os.path.join(spk_path, fn))
+                spk2files[spk].append(str(spk_path / fn))
 
-    kept_spks = sorted([spk for spk, fs in spk2files.items() if len(fs) >= cfg.min_utts_per_spk])
-    spk2id = {spk: i for i, spk in enumerate(kept_spks)}
+    kept_spks = sorted(spk for spk, fs in spk2files.items() if len(fs) >= cfg.min_utts_per_spk)
 
-    train_list_path = os.path.join(cfg.cn_out_dir, "train_fbank_list.txt")
-    val_list_path = os.path.join(cfg.cn_out_dir, "val_fbank_list.txt")
-    spk_train_path = os.path.join(cfg.cn_out_dir, "spk_to_utterances_train.json")
-    spk_val_path = os.path.join(cfg.cn_out_dir, "spk_to_utterances_val.json")
-    spk2id_path = os.path.join(cfg.cn_out_dir, "spk2id.json")
-    val_meta_path = os.path.join(cfg.cn_out_dir, "val_meta.jsonl")
+    train_list_path = cn_out_dir / "train_fbank_list.txt"
+    val_list_path = cn_out_dir / "val_fbank_list.txt"
+    spk_train_path = cn_out_dir / "spk_to_utterances_train.json"
+    spk_val_path = cn_out_dir / "spk_to_utterances_val.json"
+    spk2id_path = cn_out_dir / "spk2id.json"
+    val_meta_path = cn_out_dir / "val_meta.jsonl"
 
-    spk_to_utters_train = defaultdict(list)
-    spk_to_utters_val = defaultdict(list)
-    val_meta = []
+    if spk2id_path.is_file():
+        spk2id = load_json(str(spk2id_path))
+    else:
+        spk2id = {}
+    next_spk_id = max(spk2id.values(), default=-1) + 1
+    for spk in kept_spks:
+        if spk not in spk2id:
+            spk2id[spk] = next_spk_id
+            next_spk_id += 1
 
-    with open(train_list_path, "w", encoding="utf-8") as ftrain, open(val_list_path, "w", encoding="utf-8") as fval:
-        for spk in tqdm(kept_spks, desc="Preprocess CN-Celeb2"):
-            files = sorted(spk2files[spk])
-            random.shuffle(files)
+    existing_train_items = load_txt_pairs(str(train_list_path))
+    existing_val_items = load_txt_pairs(str(val_list_path))
+    spk_to_utters_train = defaultdict(list, load_json(str(spk_train_path)) if spk_train_path.is_file() else {})
+    spk_to_utters_val = defaultdict(list, load_json(str(spk_val_path)) if spk_val_path.is_file() else {})
+    val_meta = load_jsonl(str(val_meta_path))
 
-            n_val = max(1, int(len(files) * cfg.val_utt_ratio))
-            if n_val >= len(files):
-                n_val = len(files) - 1
+    train_relpaths = {normalize_path(path) for _, path in existing_train_items}
+    val_relpaths = {normalize_path(path) for _, path in existing_val_items}
+    existing_feat_paths = train_relpaths | val_relpaths
+    existing_val_meta_keys = {(item.get("speaker"), normalize_path(item.get("feat_path", ""))) for item in val_meta}
 
-            val_files = set(files[:n_val])
+    train_items = list(existing_train_items)
+    val_items = list(existing_val_items)
 
-            for wav_path in files:
-                try:
-                    wav = load_wav_mono(wav_path, target_sr=cfg.target_sr)
-                    if len(wav) < int(cfg.target_sr * cfg.min_sec):
-                        continue
+    new_train = 0
+    new_val = 0
+    skipped_existing = 0
 
-                    feat = wav_to_fbank(
-                        wav,
-                        n_mels=cfg.n_mels,
-                        num_crops=1,
-                        crop_sec=max(cfg.min_sec, float(len(wav)) / cfg.target_sr),
-                    )[0]
+    for spk in tqdm(kept_spks, desc="Preprocess CN-Celeb2"):
+        files = sorted(spk2files[spk])
+        train_count = len(spk_to_utters_train.get(spk, []))
+        val_count = len(spk_to_utters_val.get(spk, []))
 
-                    key = safe_key(wav_path, cfg.cn_root)
-                    feat_path = os.path.join(feat_dir, f"{spk}__{key}.pt").replace("\\", "/")
+        for wav_path in files:
+            key = safe_key(wav_path, cfg.cn_root)
+            feat_path = normalize_path(feat_dir / f"{spk}__{key}.pt")
+            if cfg.incremental and feat_path in existing_feat_paths and Path(feat_path).is_file():
+                skipped_existing += 1
+                continue
 
-                    torch.save(
-                        {
-                            "fbank": feat,
-                            "speaker": spk,
-                            "spk_id": int(spk2id[spk]),
-                            "wav_path": wav_path.replace("\\", "/"),
-                        },
-                        feat_path,
-                    )
+            try:
+                wav = load_wav_mono(wav_path, target_sr=cfg.target_sr)
+                if len(wav) < int(cfg.target_sr * cfg.min_sec):
+                    continue
 
-                    label = int(spk2id[spk])
-                    if wav_path in val_files:
-                        spk_to_utters_val[spk].append(feat_path)
-                        fval.write(f"{label} {feat_path}\n")
-                        val_meta.append(
-                            {
-                                "speaker": spk,
-                                "feat_path": feat_path,
-                                "spk_id": label,
-                            }
-                        )
-                    else:
-                        spk_to_utters_train[spk].append(feat_path)
-                        ftrain.write(f"{label} {feat_path}\n")
+                feat = wav_to_fbank(
+                    wav,
+                    n_mels=cfg.n_mels,
+                    num_crops=1,
+                    crop_sec=max(cfg.min_sec, float(len(wav)) / cfg.target_sr),
+                )[0]
 
-                except Exception as e:
-                    print(f"[WARN] skip {wav_path}: {e}")
+                torch.save(
+                    {
+                        "fbank": feat,
+                        "speaker": spk,
+                        "spk_id": int(spk2id[spk]),
+                        "wav_path": normalize_path(wav_path),
+                    },
+                    feat_path,
+                )
 
-    save_json(spk_train_path, spk_to_utters_train)
-    save_json(spk_val_path, spk_to_utters_val)
-    save_json(spk2id_path, spk2id)
-    write_jsonl(val_meta_path, val_meta)
+                label = int(spk2id[spk])
+                assign_to_val = train_count > 0 and val_count < max(1, int((train_count + val_count + 1) * cfg.val_utt_ratio))
+                if assign_to_val:
+                    spk_to_utters_val[spk].append(feat_path)
+                    val_items.append((label, feat_path))
+                    meta_item = {"speaker": spk, "feat_path": feat_path, "spk_id": label}
+                    if (spk, feat_path) not in existing_val_meta_keys:
+                        val_meta.append(meta_item)
+                        existing_val_meta_keys.add((spk, feat_path))
+                    val_count += 1
+                    new_val += 1
+                else:
+                    spk_to_utters_train[spk].append(feat_path)
+                    train_items.append((label, feat_path))
+                    train_count += 1
+                    new_train += 1
 
-    print(f"[CN DONE] speakers={len(spk2id)} out_dir={cfg.cn_out_dir}")
+                existing_feat_paths.add(feat_path)
+            except Exception as e:
+                print(f"[WARN] skip {wav_path}: {e}")
+
+    train_items = dedupe_preserve_order(train_items)
+    val_items = dedupe_preserve_order(val_items)
+    spk_to_utters_train = {spk: dedupe_preserve_order(paths) for spk, paths in spk_to_utters_train.items()}
+    spk_to_utters_val = {spk: dedupe_preserve_order(paths) for spk, paths in spk_to_utters_val.items()}
+    val_meta = dedupe_preserve_order(val_meta)
+
+    backup_metadata_files(
+        cfg,
+        output_root=str(cn_out_dir),
+        paths=[train_list_path, val_list_path, spk_train_path, spk_val_path, spk2id_path, val_meta_path],
+    )
+    save_txt_pairs(str(train_list_path), train_items)
+    save_txt_pairs(str(val_list_path), val_items)
+    save_json(str(spk_train_path), spk_to_utters_train)
+    save_json(str(spk_val_path), spk_to_utters_val)
+    save_json(str(spk2id_path), spk2id)
+    write_jsonl(str(val_meta_path), val_meta)
+
+    print(
+        f"[CN DONE] speakers={len(spk2id)} new_train={new_train} "
+        f"new_val={new_val} skipped_existing={skipped_existing} out_dir={cfg.cn_out_dir}"
+    )
+
+
+# =========================================================
+# Stage 1.5: augment single-speaker features
+# =========================================================
+def time_mask(feat: torch.Tensor, max_width: int = 20) -> torch.Tensor:
+    x = feat.clone()
+    T = x.size(0)
+    if T <= 4:
+        return x
+    w = random.randint(0, min(max_width, max(1, T // 8)))
+    if w <= 0:
+        return x
+    s = random.randint(0, max(0, T - w))
+    x[s:s + w] = 0.0
+    return x
+
+
+def freq_mask(feat: torch.Tensor, max_width: int = 8) -> torch.Tensor:
+    x = feat.clone()
+    fdim = x.size(1)
+    if fdim <= 4:
+        return x
+    w = random.randint(0, min(max_width, max(1, fdim // 6)))
+    if w <= 0:
+        return x
+    s = random.randint(0, max(0, fdim - w))
+    x[:, s:s + w] = 0.0
+    return x
+
+
+def global_gain(feat: torch.Tensor, scale_min: float = 0.85, scale_max: float = 1.18) -> torch.Tensor:
+    return feat * random.uniform(scale_min, scale_max)
+
+
+def add_gaussian_noise(feat: torch.Tensor, sigma_min: float = 0.002, sigma_max: float = 0.012) -> torch.Tensor:
+    return feat + torch.randn_like(feat) * random.uniform(sigma_min, sigma_max)
+
+
+def temporal_warp(feat: torch.Tensor, rate_min: float = 0.90, rate_max: float = 1.10) -> torch.Tensor:
+    x = feat.transpose(0, 1).unsqueeze(0)
+    t = x.size(-1)
+    rate = random.uniform(rate_min, rate_max)
+    warped_t = max(8, int(t * rate))
+    y = F.interpolate(x, size=warped_t, mode="linear", align_corners=False)
+    z = F.interpolate(y, size=t, mode="linear", align_corners=False)
+    return z.squeeze(0).transpose(0, 1).contiguous()
+
+
+def smooth_perturb(feat: torch.Tensor) -> torch.Tensor:
+    x = feat.transpose(0, 1).unsqueeze(0)
+    kernel = random.choice([3, 5])
+    pad = kernel // 2
+    weight = torch.ones(x.size(1), 1, kernel, dtype=x.dtype, device=x.device) / kernel
+    y = F.conv1d(F.pad(x, (pad, pad), mode="replicate"), weight, groups=x.size(1))
+    y = 0.72 * x + 0.28 * y
+    return y.squeeze(0).transpose(0, 1).contiguous()
+
+
+def spectral_tilt(feat: torch.Tensor, tilt_db_min: float = -5.0, tilt_db_max: float = 5.0) -> torch.Tensor:
+    x = feat.clone()
+    fdim = x.size(1)
+    db_span = random.uniform(tilt_db_min, tilt_db_max)
+    ramp = torch.linspace(-0.5, 0.5, fdim, dtype=x.dtype, device=x.device)
+    gains = torch.pow(10.0, (ramp * db_span) / 20.0)
+    return x * gains.unsqueeze(0)
+
+
+def formant_shift(feat: torch.Tensor, shift_min: float = 0.94, shift_max: float = 1.08) -> torch.Tensor:
+    x = feat.transpose(0, 1).unsqueeze(0).unsqueeze(0)
+    fdim, tdim = x.size(2), x.size(3)
+    shifted_bins = max(8, int(fdim * random.uniform(shift_min, shift_max)))
+    y = F.interpolate(x, size=(shifted_bins, tdim), mode="bilinear", align_corners=False)
+    z = F.interpolate(y, size=(fdim, tdim), mode="bilinear", align_corners=False)
+    return z.squeeze(0).squeeze(0).transpose(0, 1).contiguous()
+
+
+def energy_contour_perturb(feat: torch.Tensor, min_points: int = 4, max_points: int = 8) -> torch.Tensor:
+    x = feat.clone()
+    tdim = x.size(0)
+    num_points = random.randint(min_points, max_points)
+    control = torch.empty(num_points, dtype=x.dtype, device=x.device).uniform_(0.82, 1.20)
+    envelope = F.interpolate(control.view(1, 1, -1), size=tdim, mode="linear", align_corners=False).view(-1)
+    return x * envelope.unsqueeze(1)
+
+
+def spectral_contrast_perturb(feat: torch.Tensor, factor_min: float = 0.82, factor_max: float = 1.18) -> torch.Tensor:
+    x = feat.clone()
+    mean = x.mean(dim=1, keepdim=True)
+    factor = random.uniform(factor_min, factor_max)
+    return mean + (x - mean) * factor
+
+
+def normalize_feat(feat: torch.Tensor) -> torch.Tensor:
+    return (feat - feat.mean()) / (feat.std() + 1e-5)
+
+
+def apply_profile(feat: torch.Tensor, profile: str) -> torch.Tensor:
+    x = feat
+    if profile == "emotion_excited":
+        x = temporal_warp(x, 1.02, 1.10)
+        x = energy_contour_perturb(x)
+        x = spectral_contrast_perturb(x, 1.02, 1.20)
+    elif profile == "emotion_calm":
+        x = temporal_warp(x, 0.92, 1.00)
+        x = smooth_perturb(x)
+        x = spectral_contrast_perturb(x, 0.82, 0.98)
+    elif profile == "timbre_bright":
+        x = spectral_tilt(x, 1.5, 5.5)
+        x = formant_shift(x, 1.00, 1.08)
+    elif profile == "timbre_dark":
+        x = spectral_tilt(x, -5.5, -1.5)
+        x = formant_shift(x, 0.94, 1.00)
+    elif profile == "tone_soft":
+        x = smooth_perturb(x)
+        x = global_gain(x, 0.88, 1.02)
+    elif profile == "tone_tense":
+        x = spectral_contrast_perturb(x, 1.05, 1.18)
+        x = add_gaussian_noise(x, 0.0015, 0.006)
+    return x
+
+
+def augment_fbank(feat: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    x = feat.clone().float()
+    profile = random.choice(
+        [
+            "emotion_excited",
+            "emotion_calm",
+            "timbre_bright",
+            "timbre_dark",
+            "tone_soft",
+            "tone_tense",
+        ]
+    )
+    x = apply_profile(x, profile)
+
+    ops = []
+    if random.random() < 0.90:
+        ops.append(global_gain)
+    if random.random() < 0.75:
+        ops.append(add_gaussian_noise)
+    if random.random() < 0.60:
+        ops.append(time_mask)
+    if random.random() < 0.60:
+        ops.append(freq_mask)
+    if random.random() < 0.45:
+        ops.append(energy_contour_perturb)
+    if random.random() < 0.35:
+        ops.append(spectral_tilt)
+
+    random.shuffle(ops)
+    applied_ops = [profile]
+    for op in ops:
+        x = op(x)
+        applied_ops.append(op.__name__)
+
+    x = normalize_feat(x)
+    return x, {"profile": profile, "ops": applied_ops}
+
+
+def build_augmented_cn_lists(cfg: BuildCfg, split: str, num_aug_per_utt: int):
+    list_path = Path(cfg.cn_out_dir) / f"{split}_fbank_list.txt"
+    items = load_txt_pairs(str(list_path))
+    if not items:
+        raise FileNotFoundError(list_path)
+
+    aug_root = Path(cfg.cn_out_dir) / cfg.aug_subdir / split
+    ensure_dir(aug_root)
+
+    aug_list_path = Path(cfg.cn_out_dir) / f"{split}_fbank_list_aug.txt"
+    aug_map_path = Path(cfg.cn_out_dir) / f"spk_to_utterances_{split}_aug.json"
+    existing_items = load_txt_pairs(str(aug_list_path))
+    out_items = list(existing_items) if cfg.incremental else []
+    existing_paths = {normalize_path(path) for _, path in out_items}
+
+    new_augments = 0
+    for spk_id, pt_path in tqdm(items, desc=f"Augment {split} singles"):
+        base_path = normalize_path(pt_path)
+        if base_path not in existing_paths:
+            out_items.append((spk_id, base_path))
+            existing_paths.add(base_path)
+
+        obj = torch.load(pt_path, map_location="cpu", weights_only=False)
+        feat = obj["fbank"].float()
+        stem = Path(pt_path).stem
+
+        for k in range(num_aug_per_utt):
+            out_path = normalize_path(aug_root / f"{stem}__{cfg.augmentation_version}_aug{k}.pt")
+            if cfg.incremental and out_path in existing_paths and Path(out_path).is_file():
+                continue
+
+            aug_feat, aug_meta = augment_fbank(feat)
+            aug_obj = dict(obj)
+            aug_obj["fbank"] = aug_feat
+            aug_obj["source"] = "augmented_cn_single"
+            aug_obj["aug_index"] = k
+            aug_obj["aug_version"] = cfg.augmentation_version
+            aug_obj["aug_profile"] = aug_meta["profile"]
+            aug_obj["aug_ops"] = aug_meta["ops"]
+
+            torch.save(aug_obj, out_path)
+            out_items.append((spk_id, out_path))
+            existing_paths.add(out_path)
+            new_augments += 1
+
+    out_items = dedupe_preserve_order(out_items)
+    spk2id = load_json(str(Path(cfg.cn_out_dir) / "spk2id.json"))
+    id2spk = {int(v): k for k, v in spk2id.items()}
+    spk_to_utts: Dict[str, List[str]] = defaultdict(list)
+
+    for spk_id, path in out_items:
+        spk = id2spk[int(spk_id)]
+        spk_to_utts[spk].append(normalize_path(path))
+
+    spk_to_utts = {spk: dedupe_preserve_order(paths) for spk, paths in spk_to_utts.items()}
+
+    backup_metadata_files(cfg, output_root=cfg.cn_out_dir, paths=[aug_list_path, aug_map_path])
+    save_txt_pairs(str(aug_list_path), out_items)
+    save_json(str(aug_map_path), spk_to_utts)
+    print(f"[AUG DONE] split={split} added={new_augments} total_items={len(out_items)}")
+
+
+def build_augmented_cn(cfg: BuildCfg):
+    set_seed(cfg.seed)
+    build_augmented_cn_lists(cfg, "train", cfg.num_aug_per_utt_train)
+    build_augmented_cn_lists(cfg, "val", cfg.num_aug_per_utt_val)
 
 
 # =========================================================
@@ -376,29 +724,40 @@ def generate_mix_split(
     if len(speakers) < cfg.max_mix:
         raise ValueError(f"[{split_name}] speakers={len(speakers)} < max_mix={cfg.max_mix}")
 
-    ensure_dir(cfg.static_out_dir)
-    mix_dir = os.path.join(cfg.static_out_dir, "mix_pt", split_name)
+    static_out_dir = Path(cfg.static_out_dir)
+    ensure_dir(static_out_dir)
+    mix_dir = static_out_dir / "mix_pt" / split_name
     ensure_dir(mix_dir)
 
-    manifest_path = os.path.join(cfg.static_out_dir, f"{split_name}_manifest.jsonl")
+    manifest_path = static_out_dir / f"{split_name}_manifest.jsonl"
     feat_cache: Dict[str, torch.Tensor] = {}
+    existing_items = load_jsonl(str(manifest_path))
+    existing_relpts = {normalize_path(item["pt"]) for item in existing_items if "pt" in item}
+    start_idx = len(existing_items) if cfg.incremental else 0
+    new_items = []
 
-    with open(manifest_path, "w", encoding="utf-8") as mf:
-        for idx in tqdm(range(num_mixes), desc=f"Generate {split_name} mixes"):
-            pack = generate_one_mix(
-                speakers=speakers,
-                spk_to_utters=spk_to_utters,
-                spk2id=spk2id,
-                cfg=cfg,
-                feat_cache=feat_cache,
-                noise_pts=noise_pts,
-            )
-            rel_pt = os.path.join("mix_pt", split_name, f"{idx:08d}.pt").replace("\\", "/")
-            abs_pt = os.path.join(cfg.static_out_dir, rel_pt)
-            torch.save(pack, abs_pt)
-            mf.write(json.dumps({"pt": rel_pt}, ensure_ascii=False) + "\n")
+    for idx in tqdm(range(start_idx, start_idx + num_mixes), desc=f"Generate {split_name} mixes"):
+        pack = generate_one_mix(
+            speakers=speakers,
+            spk_to_utters=spk_to_utters,
+            spk2id=spk2id,
+            cfg=cfg,
+            feat_cache=feat_cache,
+            noise_pts=noise_pts,
+        )
+        rel_pt = normalize_path(Path("mix_pt") / split_name / f"{idx:08d}.pt")
+        if cfg.incremental and rel_pt in existing_relpts:
+            continue
+        abs_pt = static_out_dir / rel_pt
+        ensure_dir(abs_pt.parent)
+        torch.save(pack, abs_pt)
+        new_items.append({"pt": rel_pt})
 
-    print(f"[MIX DONE] {split_name}: {manifest_path}")
+    if new_items:
+        backup_metadata_files(cfg, output_root=cfg.static_out_dir, paths=[manifest_path])
+        append_jsonl(str(manifest_path), new_items)
+
+    print(f"[MIX DONE] {split_name}: added={len(new_items)} manifest={manifest_path}")
 
 
 def build_static_mix(cfg: BuildCfg):
@@ -424,9 +783,12 @@ def build_static_mix(cfg: BuildCfg):
     spk2id = load_json(spk2id_path)
 
     ensure_dir(cfg.static_out_dir)
-    save_json(os.path.join(cfg.static_out_dir, "spk2id.json"), spk2id)
+    spk2id_out = os.path.join(cfg.static_out_dir, "spk2id.json")
+    mix_meta_path = os.path.join(cfg.static_out_dir, "mix_meta.json")
+    backup_metadata_files(cfg, output_root=cfg.static_out_dir, paths=[spk2id_out, mix_meta_path])
+    save_json(spk2id_out, spk2id)
     save_json(
-        os.path.join(cfg.static_out_dir, "mix_meta.json"),
+        mix_meta_path,
         {
             "cn_out_dir": cfg.cn_out_dir,
             "static_out_dir": cfg.static_out_dir,
@@ -445,6 +807,8 @@ def build_static_mix(cfg: BuildCfg):
             "allow_overlap": cfg.allow_overlap,
             "max_offset_ratio": cfg.max_offset_ratio,
             "seed": cfg.seed,
+            "incremental": cfg.incremental,
+            "augmentation_version": cfg.augmentation_version,
         },
     )
 
@@ -471,21 +835,11 @@ def infer_max_mix_from_manifest(static_mix_dir: str, manifest_name: str) -> int:
 
 
 def collect_cn_single_items(cn_out_dir: str, split: str) -> List[Tuple[int, str]]:
-    list_path = os.path.join(cn_out_dir, f"{split}_fbank_list.txt")
+    aug_list_path = os.path.join(cn_out_dir, f"{split}_fbank_list_aug.txt")
+    list_path = aug_list_path if os.path.isfile(aug_list_path) else os.path.join(cn_out_dir, f"{split}_fbank_list.txt")
     if not os.path.isfile(list_path):
         raise FileNotFoundError(list_path)
-
-    out = []
-    with open(list_path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            sp = s.split(maxsplit=1)
-            if len(sp) != 2:
-                continue
-            out.append((int(sp[0]), sp[1]))
-    return out
+    return load_txt_pairs(list_path)
 
 
 def build_single_pack_from_cn_pt(cn_pt_path: str, spk_id: int, max_mix: int):
@@ -521,18 +875,15 @@ def get_existing_relpts(static_mix_dir: str, manifest_name: str) -> set:
 def append_single_samples(cfg: BuildCfg):
     set_seed(cfg.seed)
 
-    train_manifest = os.path.join(cfg.static_out_dir, "train_manifest.jsonl")
-    val_manifest = os.path.join(cfg.static_out_dir, "val_manifest.jsonl")
-    if not os.path.isfile(train_manifest):
+    train_manifest = Path(cfg.static_out_dir) / "train_manifest.jsonl"
+    val_manifest = Path(cfg.static_out_dir) / "val_manifest.jsonl"
+    if not train_manifest.is_file():
         raise FileNotFoundError(train_manifest)
-    if not os.path.isfile(val_manifest):
+    if not val_manifest.is_file():
         raise FileNotFoundError(val_manifest)
 
-    if cfg.backup_manifest:
-        backup_file(train_manifest)
-        backup_file(val_manifest)
-
     max_mix = infer_max_mix_from_manifest(cfg.static_out_dir, "train_manifest.jsonl")
+    backup_metadata_files(cfg, output_root=cfg.static_out_dir, paths=[train_manifest, val_manifest])
 
     for split, n_add in [("train", cfg.add_single_train), ("val", cfg.add_single_val)]:
         items = collect_cn_single_items(cfg.cn_out_dir, split)
@@ -541,25 +892,26 @@ def append_single_samples(cfg: BuildCfg):
 
         existing = get_existing_relpts(cfg.static_out_dir, f"{split}_manifest.jsonl")
         appended = []
-        out_dir = os.path.join(cfg.static_out_dir, cfg.add_single_subdir, split)
+        out_dir = Path(cfg.static_out_dir) / cfg.add_single_subdir / split
         ensure_dir(out_dir)
+        start_idx = next_available_index(out_dir, prefix="single_")
 
         for idx, (spk_id, cn_pt_path) in enumerate(items):
             try:
                 base = Path(cn_pt_path).stem
-                rel_pt = os.path.join(cfg.add_single_subdir, split, f"single_{idx:06d}_{base}.pt").replace("\\", "/")
+                rel_pt = normalize_path(Path(cfg.add_single_subdir) / split / f"single_{start_idx + idx:06d}_{base}.pt")
                 if cfg.skip_existing and rel_pt in existing:
                     continue
 
                 pack = build_single_pack_from_cn_pt(cn_pt_path, spk_id, max_mix)
-                abs_pt = os.path.join(cfg.static_out_dir, rel_pt)
-                ensure_dir(os.path.dirname(abs_pt))
+                abs_pt = Path(cfg.static_out_dir) / rel_pt
+                ensure_dir(abs_pt.parent)
                 torch.save(pack, abs_pt)
                 appended.append({"pt": rel_pt, "source": "cn_celeb2_single"})
             except Exception as e:
                 print(f"[WARN] single skip {cn_pt_path}: {e}")
 
-        append_jsonl(os.path.join(cfg.static_out_dir, f"{split}_manifest.jsonl"), appended)
+        append_jsonl(str(Path(cfg.static_out_dir) / f"{split}_manifest.jsonl"), appended)
         print(f"[ADD SINGLE] {split}: added={len(appended)}")
 
 
@@ -736,13 +1088,16 @@ def add_negative_samples(cfg: BuildCfg):
     max_mix = infer_max_mix_from_manifest(cfg.static_out_dir, "train_manifest.jsonl")
 
     for split, n_add in [("train", cfg.add_neg_train), ("val", cfg.add_neg_val)]:
-        out_dir = os.path.join(cfg.static_out_dir, cfg.add_neg_subdir, split)
+        out_dir = Path(cfg.static_out_dir) / cfg.add_neg_subdir / split
         ensure_dir(out_dir)
 
-        manifest_path = os.path.join(cfg.static_out_dir, f"{split}_manifest.jsonl")
+        manifest_path = Path(cfg.static_out_dir) / f"{split}_manifest.jsonl"
+        backup_metadata_files(cfg, output_root=cfg.static_out_dir, paths=[manifest_path])
         new_items = []
+        start_idx = next_available_index(out_dir, prefix="neg_")
+        existing = get_existing_relpts(cfg.static_out_dir, f"{split}_manifest.jsonl")
 
-        for i in range(n_add):
+        for i in range(start_idx, start_idx + n_add):
             sec = random.choice(NEG_DURATIONS)
             kind = random.choices(NEG_TYPES, weights=NEG_WEIGHTS, k=1)[0]
 
@@ -751,8 +1106,10 @@ def add_negative_samples(cfg: BuildCfg):
             pack = build_negative_pack(fbank, max_mix=max_mix)
 
             fname = f"neg_{kind}_{i:06d}.pt"
-            abs_pt = os.path.join(out_dir, fname)
-            rel_pt = os.path.relpath(abs_pt, cfg.static_out_dir).replace("\\", "/")
+            abs_pt = out_dir / fname
+            rel_pt = normalize_path(abs_pt.relative_to(cfg.static_out_dir))
+            if cfg.skip_existing and rel_pt in existing:
+                continue
 
             torch.save(pack, abs_pt)
             new_items.append(
@@ -764,10 +1121,11 @@ def add_negative_samples(cfg: BuildCfg):
                 }
             )
 
-            if (i + 1) % 200 == 0:
-                print(f"[{split}] negative generated {i+1}/{n_add}")
+            generated = i - start_idx + 1
+            if generated % 200 == 0:
+                print(f"[{split}] negative generated {generated}/{n_add}")
 
-        append_jsonl(manifest_path, new_items)
+        append_jsonl(str(manifest_path), new_items)
         print(f"[ADD NEG] {split}: added={len(new_items)}")
 
 
@@ -778,9 +1136,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Unified preprocessing script for Speaker-Verification")
 
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["cn", "mix", "add_single", "add_negative", "all"])
+                        choices=["cn", "augment_cn", "mix", "add_single", "add_negative", "all"])
 
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--incremental", dest="incremental", action="store_true")
+    parser.add_argument("--no-incremental", dest="incremental", action="store_false")
+    parser.set_defaults(incremental=True)
+    parser.add_argument("--backup_manifest", dest="backup_manifest", action="store_true")
+    parser.add_argument("--no-backup_manifest", dest="backup_manifest", action="store_false")
+    parser.set_defaults(backup_manifest=True)
+    parser.add_argument("--backup_dir_name", type=str, default="_backups")
 
     parser.add_argument("--cn_root", type=str, default="../CN-Celeb_flac")
     parser.add_argument("--cn_out_dir", type=str, default="../processed/cn_celeb2")
@@ -810,6 +1175,10 @@ def parse_args():
     parser.add_argument("--add_single_val", type=int, default=500)
     parser.add_argument("--add_neg_train", type=int, default=4000)
     parser.add_argument("--add_neg_val", type=int, default=500)
+    parser.add_argument("--num_aug_per_utt_train", type=int, default=4)
+    parser.add_argument("--num_aug_per_utt_val", type=int, default=1)
+    parser.add_argument("--aug_subdir", type=str, default="fbank_pt_aug")
+    parser.add_argument("--augmentation_version", type=str, default="v2")
 
     args = parser.parse_args()
     return BuildCfg(**vars(args))
@@ -817,10 +1186,14 @@ def parse_args():
 
 def main():
     cfg = parse_args()
+    if not cfg.backup_tag:
+        cfg.backup_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(json.dumps(asdict(cfg), ensure_ascii=False, indent=2))
 
     if cfg.stage == "cn":
         preprocess_cn_celeb2(cfg)
+    elif cfg.stage == "augment_cn":
+        build_augmented_cn(cfg)
     elif cfg.stage == "mix":
         build_static_mix(cfg)
     elif cfg.stage == "add_single":
@@ -829,6 +1202,7 @@ def main():
         add_negative_samples(cfg)
     elif cfg.stage == "all":
         preprocess_cn_celeb2(cfg)
+        build_augmented_cn(cfg)
         build_static_mix(cfg)
         append_single_samples(cfg)
         add_negative_samples(cfg)
