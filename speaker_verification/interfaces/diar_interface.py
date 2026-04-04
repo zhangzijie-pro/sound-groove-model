@@ -3,12 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Literal, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
 
 from speaker_verification.models.resowave import ResoWave
 from speaker_verification.audio.features import TARGET_SR, wav_to_fbank_infer
+
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+except ImportError:
+    KMeans = None
+    silhouette_score = None
 
 
 class SpeakerBankProtocol(Protocol):
@@ -90,6 +98,25 @@ def remove_short_active_runs(active_mask: torch.Tensor, min_active_frames: int =
     return active_mask
 
 
+def fill_short_inactive_gaps(active_mask: torch.Tensor, max_gap_frames: int = 3) -> torch.Tensor:
+    if active_mask.numel() == 0 or max_gap_frames <= 0:
+        return active_mask
+    active_mask = active_mask.clone()
+    t, T = 0, active_mask.numel()
+    while t < T:
+        v = bool(active_mask[t].item())
+        end = t + 1
+        while end < T and bool(active_mask[end].item()) == v:
+            end += 1
+        if (not v) and (end - t) <= max_gap_frames:
+            left_active = t > 0 and bool(active_mask[t - 1].item())
+            right_active = end < T and bool(active_mask[end].item())
+            if left_active and right_active:
+                active_mask[t:end] = True
+        t = end
+    return active_mask
+
+
 def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     a = F.normalize(a, dim=0)
     b = F.normalize(b, dim=0)
@@ -140,10 +167,152 @@ def merge_similar_slots(
     return merged, merge_map
 
 
+def smooth_active_labels(local_frame_ids: torch.Tensor, min_run: int = 3) -> torch.Tensor:
+    if local_frame_ids.numel() == 0:
+        return local_frame_ids
+    out = local_frame_ids.clone()
+    t, T = 0, out.numel()
+    while t < T:
+        if int(out[t].item()) <= 0:
+            t += 1
+            continue
+        end = t + 1
+        while end < T and int(out[end].item()) > 0:
+            end += 1
+        out[t:end] = smooth_sequence(out[t:end], min_run=min_run)
+        t = end
+    return out
+
+
+def build_slot_results(
+    frame_embeds: torch.Tensor,
+    local_frame_ids: torch.Tensor,
+    frame_shift_sec: float,
+    speaker_bank: SpeakerBankProtocol,
+) -> List[SlotResult]:
+    slots: List[SlotResult] = []
+    slot_ids = sorted(set(local_frame_ids.tolist()) - {0})
+    for slot_id in slot_ids:
+        mask = local_frame_ids == int(slot_id)
+        n = int(mask.sum().item())
+        if n <= 0:
+            continue
+        proto = F.normalize(frame_embeds[mask].mean(dim=0), p=2, dim=-1)
+        ident = speaker_bank.identify(proto)
+        slots.append(
+            SlotResult(
+                slot=int(slot_id),
+                name=ident.get("name", f"speaker_{slot_id}"),
+                score=ident.get("score", None),
+                is_known=bool(ident.get("is_known", False)),
+                num_frames=n,
+                duration_sec=round(n * frame_shift_sec, 4),
+                prototype=proto.detach().cpu(),
+            )
+        )
+    return slots
+
+
+def adaptive_cluster_frame_embeddings(
+    frame_embeds: torch.Tensor,
+    active_mask: torch.Tensor,
+    count_logits: torch.Tensor,
+    max_speakers: int,
+    min_cluster_frames: int,
+    min_silhouette: float,
+    count_prior_bias: float,
+    merge_sim_threshold: float,
+) -> Tuple[torch.Tensor, int]:
+    device = frame_embeds.device
+    local_frame_ids = torch.zeros(frame_embeds.size(0), dtype=torch.long, device=device)
+
+    active_idx = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
+    if active_idx.numel() == 0:
+        return local_frame_ids, 0
+
+    active_embeds = F.normalize(frame_embeds[active_idx], p=2, dim=-1)
+    n_active = int(active_idx.numel())
+
+    count_probs = torch.softmax(count_logits.float(), dim=-1)
+    count_prior = int(count_probs.argmax(dim=0).item())
+    count_prior_conf = float(count_probs[count_prior].item())
+
+    if n_active < max(min_cluster_frames * 2, 12) or max_speakers <= 1 or KMeans is None:
+        local_frame_ids[active_idx] = 1
+        return local_frame_ids, 1
+
+    candidate_max = min(int(max_speakers), max(1, n_active // max(1, min_cluster_frames)))
+    if candidate_max <= 1:
+        local_frame_ids[active_idx] = 1
+        return local_frame_ids, 1
+
+    x_np = active_embeds.detach().cpu().numpy()
+    active_embeds_cpu = active_embeds.detach().cpu()
+
+    best_k = 1
+    best_score = float("-inf")
+    best_labels: Optional[np.ndarray] = None
+
+    for k in range(2, candidate_max + 1):
+        try:
+            labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(x_np)
+        except Exception:
+            continue
+
+        counts = np.bincount(labels, minlength=k)
+        if counts.min() < min_cluster_frames:
+            continue
+
+        try:
+            sil = float(silhouette_score(x_np, labels, metric="cosine"))
+        except Exception:
+            continue
+
+        centers: List[torch.Tensor] = []
+        for cid in range(k):
+            mask = torch.from_numpy(labels == cid)
+            center = F.normalize(active_embeds_cpu[mask].mean(dim=0), p=2, dim=-1)
+            centers.append(center)
+
+        max_center_sim = -1.0
+        if len(centers) >= 2:
+            for i in range(len(centers)):
+                for j in range(i + 1, len(centers)):
+                    max_center_sim = max(max_center_sim, float(torch.dot(centers[i], centers[j]).item()))
+
+        balance_bonus = 0.05 * float(counts.min() / max(counts.max(), 1))
+        score = sil + balance_bonus
+
+        if k == count_prior and count_prior_conf >= 0.35:
+            score += count_prior_bias * count_prior_conf
+        elif count_prior_conf >= 0.65:
+            score -= 0.01 * abs(k - max(count_prior, 1))
+
+        if max_center_sim > merge_sim_threshold:
+            score -= 0.10 * (max_center_sim - merge_sim_threshold)
+
+        if score > best_score:
+            best_k = k
+            best_score = score
+            best_labels = labels
+
+    use_multi_cluster = best_labels is not None and (
+        best_score >= min_silhouette or (count_prior >= 2 and count_prior_conf >= 0.75)
+    )
+
+    if not use_multi_cluster:
+        local_frame_ids[active_idx] = 1
+        return local_frame_ids, 1
+
+    local_frame_ids[active_idx] = torch.from_numpy(best_labels).to(device=device, dtype=torch.long) + 1
+    return local_frame_ids, int(best_k)
+
+
 def frames_to_segments(
     local_frame_ids: torch.Tensor,
     frame_shift_sec: float,
     slot_to_name: Dict[int, str],
+    offset_sec: float = 0.0,
 ) -> List[SegmentResult]:
     segments: List[SegmentResult] = []
     T = local_frame_ids.numel()
@@ -162,8 +331,8 @@ def frames_to_segments(
             SegmentResult(
                 slot=slot,
                 name=slot_to_name.get(slot, f"slot_{slot}"),
-                start_sec=round(start * frame_shift_sec, 4),
-                end_sec=round(end * frame_shift_sec, 4),
+                start_sec=round(offset_sec + start * frame_shift_sec, 4),
+                end_sec=round(offset_sec + end * frame_shift_sec, 4),
                 duration_sec=round((end - start) * frame_shift_sec, 4),
             )
         )
@@ -187,6 +356,11 @@ class SpeakerAwareDiarizationInterface:
         fbank_energy_threshold: float = 0.020,
         min_activity_ratio: float = 0.10,
         min_mean_activity_prob: float = 0.35,
+        fill_gap_frames: int = 3,
+        cluster_min_frames: int = 12,
+        cluster_silhouette_threshold: float = 0.02,
+        cluster_count_prior_bias: float = 0.04,
+        cluster_merge_threshold: float = 0.94,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.activity_threshold = float(activity_threshold)
@@ -199,6 +373,11 @@ class SpeakerAwareDiarizationInterface:
         self.min_activity_ratio = float(min_activity_ratio)
         self.min_mean_activity_prob = float(min_mean_activity_prob)
         self.max_mix_speakers = int(max_mix_speakers)
+        self.fill_gap_frames = int(fill_gap_frames)
+        self.cluster_min_frames = int(cluster_min_frames)
+        self.cluster_silhouette_threshold = float(cluster_silhouette_threshold)
+        self.cluster_count_prior_bias = float(cluster_count_prior_bias)
+        self.cluster_merge_threshold = float(cluster_merge_threshold)
 
         self.model = ResoWave(
             in_channels=feat_dim,
@@ -235,6 +414,7 @@ class SpeakerAwareDiarizationInterface:
         crop_sec: Optional[float] = None,
         crop_mode: Literal["tail", "center", "none"] = "tail",
         normalize: bool = True,
+        offset_sec: float = 0.0,
     ) -> ChunkInferenceResult:
         if wav.dim() == 2 and wav.shape[0] == 1:
             wav = wav.squeeze(0)
@@ -252,10 +432,10 @@ class SpeakerAwareDiarizationInterface:
             crop_sec=crop_sec,
             crop_mode=crop_mode,
         )
-        return self.infer_fbank(fbank)
+        return self.infer_fbank(fbank, offset_sec=offset_sec)
 
     @torch.no_grad()
-    def infer_fbank(self, fbank: torch.Tensor) -> ChunkInferenceResult:
+    def infer_fbank(self, fbank: torch.Tensor, offset_sec: float = 0.0) -> ChunkInferenceResult:
         if fbank.dim() == 2:
             fbank = fbank.unsqueeze(0)
         if fbank.dim() != 3:
@@ -276,50 +456,38 @@ class SpeakerAwareDiarizationInterface:
         activity_logits = activity_logits[0]
         count_logits = count_logits[0]
 
-        pred_count = int(count_logits.argmax(dim=0).item())
         activity_prob = torch.sigmoid(activity_logits)
         active_mask = activity_prob >= self.activity_threshold
+        active_mask = fill_short_inactive_gaps(active_mask, self.fill_gap_frames)
         active_mask = remove_short_active_runs(active_mask, self.min_active_frames)
 
         activity_ratio = float(active_mask.float().mean().item())
         mean_activity_prob = float(activity_prob.mean().item())
 
-        if pred_count <= 0 or activity_ratio < self.min_activity_ratio or mean_activity_prob < self.min_mean_activity_prob:
+        if activity_ratio < self.min_activity_ratio or mean_activity_prob < self.min_mean_activity_prob:
             out = self._empty_result(num_frames)
             out.activity_ratio = activity_ratio
             out.frame_activity_prob = activity_prob.detach().cpu()
             return out
 
-        speaker_logits = slot_logits[:, 1:] if slot_logits.size(-1) == self.max_mix_speakers + 1 else slot_logits
-        raw_slot_ids = speaker_logits.argmax(dim=-1)
-        raw_slot_ids = smooth_sequence(raw_slot_ids, self.min_slot_run)
+        local_frame_ids, _ = adaptive_cluster_frame_embeddings(
+            frame_embeds=frame_embeds,
+            active_mask=active_mask,
+            count_logits=count_logits,
+            max_speakers=self.max_mix_speakers,
+            min_cluster_frames=self.cluster_min_frames,
+            min_silhouette=self.cluster_silhouette_threshold,
+            count_prior_bias=self.cluster_count_prior_bias,
+            merge_sim_threshold=self.cluster_merge_threshold,
+        )
+        local_frame_ids = smooth_active_labels(local_frame_ids, min_run=self.min_slot_run)
 
-        slot_counts: Dict[int, int] = {}
-        for s in raw_slot_ids[active_mask].tolist():
-            s = int(s)
-            slot_counts[s] = slot_counts.get(s, 0) + 1
-
-        raw_kept_slots = [k for k, _ in sorted(slot_counts.items(), key=lambda x: x[1], reverse=True)][:max(pred_count, 1)]
-
-        raw_slots: List[SlotResult] = []
-        for raw_slot in raw_kept_slots:
-            mask = (raw_slot_ids == raw_slot) & active_mask
-            n = int(mask.sum().item())
-            if n <= 0:
-                continue
-            proto = F.normalize(frame_embeds[mask].mean(dim=0), p=2, dim=-1)
-            ident = self.speaker_bank.identify(proto)
-            raw_slots.append(
-                SlotResult(
-                    slot=int(raw_slot),
-                    name=ident.get("name", f"slot_{raw_slot}"),
-                    score=ident.get("score", None),
-                    is_known=bool(ident.get("is_known", False)),
-                    num_frames=n,
-                    duration_sec=round(n * self.frame_shift_sec, 4),
-                    prototype=proto.detach().cpu(),
-                )
-            )
+        raw_slots = build_slot_results(
+            frame_embeds=frame_embeds,
+            local_frame_ids=local_frame_ids,
+            frame_shift_sec=self.frame_shift_sec,
+            speaker_bank=self.speaker_bank,
+        )
 
         if len(raw_slots) == 0:
             out = self._empty_result(num_frames)
@@ -327,33 +495,19 @@ class SpeakerAwareDiarizationInterface:
             out.frame_activity_prob = activity_prob.detach().cpu()
             return out
 
-        merged_slots, merge_map = merge_similar_slots(raw_slots, sim_threshold=0.85)
-
-        if len(merged_slots) >= 2:
-            if cosine_sim(merged_slots[0].prototype, merged_slots[1].prototype) >= 0.90:
-                merged_slots, merge_map = merge_similar_slots(merged_slots, sim_threshold=0.90)
-
-        merged_slots = merged_slots[: min(pred_count, len(merged_slots))]
-        if len(merged_slots) == 0:
-            out = self._empty_result(num_frames)
-            out.activity_ratio = activity_ratio
-            out.frame_activity_prob = activity_prob.detach().cpu()
-            return out
-
-        rep_slots = [int(s.slot) for s in merged_slots]
-        rep_set = set(rep_slots)
-
+        merged_slots, merge_map = merge_similar_slots(
+            raw_slots,
+            sim_threshold=self.cluster_merge_threshold,
+        )
         raw_to_final: Dict[int, int] = {}
         next_local = 1
         final_slots: List[SlotResult] = []
         slot_to_name: Dict[int, str] = {}
 
         for s in merged_slots:
-            rep = int(s.slot)
-            if rep not in rep_set:
-                continue
             local_id = next_local
             next_local += 1
+            rep = int(s.slot)
             for raw_slot, mapped_rep in merge_map.items():
                 if int(mapped_rep) == rep:
                     raw_to_final[int(raw_slot)] = local_id
@@ -370,22 +524,23 @@ class SpeakerAwareDiarizationInterface:
             final_slots.append(final_slot)
             slot_to_name[local_id] = s.name
 
-        local_frame_ids = torch.zeros_like(raw_slot_ids, dtype=torch.long)
+        merged_frame_ids = torch.zeros_like(local_frame_ids, dtype=torch.long)
         for raw_slot, local_id in raw_to_final.items():
-            local_frame_ids[(raw_slot_ids == int(raw_slot)) & active_mask] = int(local_id)
+            merged_frame_ids[local_frame_ids == int(raw_slot)] = int(local_id)
 
-        kept_activity_ratio = float((local_frame_ids > 0).float().mean().item())
+        kept_activity_ratio = float((merged_frame_ids > 0).float().mean().item())
         if kept_activity_ratio < self.min_activity_ratio:
             out = self._empty_result(num_frames)
             out.activity_ratio = kept_activity_ratio
             out.frame_activity_prob = activity_prob.detach().cpu()
             return out
 
-        local_frame_ids_cpu = local_frame_ids.detach().cpu()
+        local_frame_ids_cpu = merged_frame_ids.detach().cpu()
         segments = frames_to_segments(
             local_frame_ids=local_frame_ids_cpu,
             frame_shift_sec=self.frame_shift_sec,
             slot_to_name=slot_to_name,
+            offset_sec=offset_sec,
         )
 
         dominant_slot = max(final_slots, key=lambda x: x.num_frames).slot
@@ -412,6 +567,7 @@ class SpeakerAwareDiarizationInterface:
             "slots": [
                 {
                     "slot": s.slot,
+                    "speaker_id": s.slot,
                     "name": s.name,
                     "score": s.score,
                     "is_known": s.is_known,
@@ -423,6 +579,7 @@ class SpeakerAwareDiarizationInterface:
             "segments": [
                 {
                     "slot": seg.slot,
+                    "speaker_id": seg.slot,
                     "name": seg.name,
                     "start_sec": seg.start_sec,
                     "end_sec": seg.end_sec,

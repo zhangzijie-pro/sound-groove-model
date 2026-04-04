@@ -68,19 +68,20 @@ def SE_Res2Block(channels, kernel_size, stride, padding, dilation, scale):
     )
 
 
-class AttentiveStatsPool(nn.Module):
-    def __init__(self, in_dim, bottleneck_dim):
+class FeedForwardAdapter(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
-        self.linear1 = nn.Conv1d(in_dim, bottleneck_dim, kernel_size=1)
-        self.linear2 = nn.Conv1d(bottleneck_dim, in_dim, kernel_size=1)
+        self.norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x):
-        alpha = torch.tanh(self.linear1(x))
-        alpha = torch.softmax(self.linear2(alpha), dim=2)
-        mean = torch.sum(alpha * x, dim=2)
-        residuals = torch.sum(alpha * x ** 2, dim=2) - mean ** 2
-        std = torch.sqrt(residuals.clamp(min=1e-9))
-        return torch.cat([mean, std], dim=1)
+        return x + self.ffn(self.norm(x))
 
 
 class ResoWave(nn.Module):
@@ -90,6 +91,8 @@ class ResoWave(nn.Module):
         channels=512,
         embedding_dim=192,
         max_mix_speakers=5,
+        post_ffn_hidden_dim=None,
+        post_ffn_dropout=0.1,
         **kwargs,
     ):
         super().__init__()
@@ -110,16 +113,16 @@ class ResoWave(nn.Module):
             embedding_dim = alias_embedding_dim
 
         embedding_dim = int(embedding_dim)
+        post_ffn_hidden_dim = int(post_ffn_hidden_dim or channels * 2)
         self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)
         self.layer2 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=2, dilation=2, scale=8)
         self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
         self.layer4 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
-
-        self.conv = nn.Conv1d(channels * 3, 1536, kernel_size=1)
-        self.pooling = AttentiveStatsPool(1536, 128)
-        self.bn1 = nn.BatchNorm1d(3072)
-        self.linear = nn.Linear(3072, embedding_dim)
-        self.bn2 = nn.BatchNorm1d(embedding_dim)
+        self.post_out4_ffn = FeedForwardAdapter(
+            dim=channels,
+            hidden_dim=post_ffn_hidden_dim,
+            dropout=post_ffn_dropout,
+        )
 
         self.diar_head = REAT_DiarizationHead(
             in_dim=channels,
@@ -138,17 +141,11 @@ class ResoWave(nn.Module):
         out3 = self.layer3(out1 + out2)
         out4 = self.layer4(out1 + out2 + out3)  # [B,512,T]
 
-        out = torch.cat([out2, out3, out4], dim=1)
-        out = F.relu(self.conv(out))
-
-        pooled = self.pooling(out)
-        emb = self.bn1(pooled)
-        emb = self.bn2(self.linear(emb))
-        emb = F.normalize(emb, p=2, dim=1)  # [B,192]
+        frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
+        frame_feat = self.post_out4_ffn(frame_feat)
+        frame_embeds, slot_logits, activity_logits, count_logits = self.diar_head(frame_feat)
+        global_emb = F.normalize(frame_embeds.mean(dim=1), p=2, dim=-1)
 
         if return_diarization:
-            frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
-            frame_embeds, slot_logits, activity_logits, count_logits = self.diar_head(frame_feat)
-            return emb, frame_embeds, slot_logits, activity_logits, count_logits
-
-        return emb
+            return global_emb, frame_embeds, slot_logits, activity_logits, count_logits
+        return global_emb

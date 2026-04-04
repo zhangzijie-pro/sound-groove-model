@@ -55,6 +55,7 @@ def segments_with_global_ids(result, local_to_global):
         out.append(
             {
                 "slot": int(seg.slot),
+                "speaker_id": int(gid),
                 "global_id": int(gid),
                 "name": seg.name,
                 "start_sec": float(seg.start_sec),
@@ -86,6 +87,11 @@ def main():
     parser.add_argument("--fbank_energy_threshold", type=float, default=0.020)
     parser.add_argument("--min_activity_ratio", type=float, default=0.15)
     parser.add_argument("--min_mean_activity_prob", type=float, default=0.40)
+    parser.add_argument("--fill_gap_frames", type=int, default=3)
+    parser.add_argument("--cluster_min_frames", type=int, default=12)
+    parser.add_argument("--cluster_silhouette_threshold", type=float, default=0.02)
+    parser.add_argument("--cluster_count_prior_bias", type=float, default=0.04)
+    parser.add_argument("--cluster_merge_threshold", type=float, default=0.94)
 
     parser.add_argument("--tracker_match_threshold", type=float, default=0.72)
     parser.add_argument("--tracker_momentum", type=float, default=0.90)
@@ -115,6 +121,11 @@ def main():
         fbank_energy_threshold=args.fbank_energy_threshold,
         min_activity_ratio=args.min_activity_ratio,
         min_mean_activity_prob=args.min_mean_activity_prob,
+        fill_gap_frames=args.fill_gap_frames,
+        cluster_min_frames=args.cluster_min_frames,
+        cluster_silhouette_threshold=args.cluster_silhouette_threshold,
+        cluster_count_prior_bias=args.cluster_count_prior_bias,
+        cluster_merge_threshold=args.cluster_merge_threshold,
     )
 
     tracker = GlobalSpeakerTracker(
@@ -126,14 +137,17 @@ def main():
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
     ring = AudioRingBuffer(max_seconds=args.chunk_sec, sr=args.sr)
+    total_samples_seen = 0
 
     smooth_num_speakers = deque(maxlen=max(1, args.smooth_windows))
     last_infer_time = 0.0
 
     def callback(indata, frames, time_info, status):
+        nonlocal total_samples_seen
         if status:
             print(f"[AudioStatus] {status}", file=sys.stderr)
         mono = indata[:, 0].astype(np.float32)
+        total_samples_seen += int(mono.shape[0])
         audio_q.put(mono.copy())
 
     print("=" * 80)
@@ -182,12 +196,14 @@ def main():
                     }
                 else:
                     wav_tensor = torch.from_numpy(wav).float()
+                    chunk_offset_sec = max(0.0, (total_samples_seen - wav.shape[0]) / args.sr)
                     result = monitor.infer_wav(
                         wav_tensor,
                         sample_rate=args.sr,
                         crop_sec=args.chunk_sec,
                         crop_mode="tail",
                         normalize=True,
+                        offset_sec=chunk_offset_sec,
                     )
 
                     tracker_result = tracker.update(result)

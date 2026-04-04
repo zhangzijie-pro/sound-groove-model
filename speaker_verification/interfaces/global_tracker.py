@@ -35,13 +35,13 @@ class GlobalSpeakerTracker:
         momentum: float = 0.9,
         max_misses: int = 30,
         device: str = "cpu",
-        quantizer = None
+        # quantizer = None
     ):
         self.match_threshold = float(match_threshold)
         self.momentum = float(momentum)
         self.max_misses = int(max_misses)
         self.device = torch.device(device)
-        self.quantizer = quantizer
+        # self.quantizer = quantizer
         
         self.tracks: Dict[int, Track] = {}
         self.next_global_id = 1
@@ -62,7 +62,7 @@ class GlobalSpeakerTracker:
 
     def _encode_proto(self, proto: torch.Tensor) -> tuple[Optional[torch.Tensor], Optional[QuantizedTensorState]]:
         proto = self._norm(proto.detach().to(self.device))
-        if self.quantizer is not None:
+        if self.quantizer is None:
             return proto, None
         qstate = self.quantizer.quantize(proto)
         return None, qstate
