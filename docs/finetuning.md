@@ -151,42 +151,32 @@ python3 train.py \
 ## 6. Loss Function Logic / Loss Function 设置逻辑
 
 **EN**  
-The current objective is multi-task. You are not tuning a single scalar loss; you are balancing diarization quality, activity detection, count prediction, and frame-prototype consistency.
+The current objective is end-to-end diarization. The main supervision is PIT BCE on frame-wise speaker masks, plus a lightweight temporal smoothness regularizer to suppress frame-level flicker.
 
 Relevant YAML keys:
 
-- `loss.lambda_pit`
-- `loss.lambda_act`
-- `loss.lambda_cnt`
-- `loss.lambda_frm`
-- `loss.pos_weight`
 - `loss.pit_pos_weight`
+- `loss.lambda_smooth`
 
 Practical guidance:
 
-- increase `lambda_pit` if slot assignment quality is the bottleneck
-- increase `lambda_act` if voice activity boundaries are unstable
-- increase `lambda_cnt` if speaker count is consistently off
-- increase `lambda_frm` if identity separation is weak across adjacent speakers
+- increase `pit_pos_weight` if miss errors dominate overlapped or low-energy speech
+- increase `lambda_smooth` if frame boundaries are too jittery at inference time
+- decrease `lambda_smooth` if the model becomes too slow to react to fast turn changes
 
 **中文**  
-当前训练目标是多任务损失，不是在调一个单一标量，而是在平衡 diarization、activity、speaker count 和 frame prototype 一致性。
+当前训练目标是端到端 diarization。主监督是逐帧说话人掩码上的 PIT BCE，再加一个较轻的时间平滑正则，用来抑制逐帧闪烁。
 
 相关 YAML 字段：
 
-- `loss.lambda_pit`
-- `loss.lambda_act`
-- `loss.lambda_cnt`
-- `loss.lambda_frm`
-- `loss.pos_weight`
 - `loss.pit_pos_weight`
+- `loss.lambda_smooth`
 
 实践建议：
 
-- 如果 slot assignment 是瓶颈，就提高 `lambda_pit`
-- 如果语音活动边界不稳，就提高 `lambda_act`
-- 如果说话人数估计偏差大，就提高 `lambda_cnt`
-- 如果相邻说话人的身份区分弱，就提高 `lambda_frm`
+- 如果漏检偏多，尤其是重叠语音或低能量语音，就提高 `pit_pos_weight`
+- 如果推理阶段边界抖动明显，就提高 `lambda_smooth`
+- 如果模型对快速轮转反应变慢，就降低 `lambda_smooth`
 
 ## 7. Loading Rules / 权重加载规则
 
@@ -231,4 +221,3 @@ If those do not match, strict loading will fail or, worse, partial loading will 
 - Data guide: [`docs/data_guide.md`](./data_guide.md)
 - Checkpoint schema: [`docs/specs/checkpoint-schema.md`](./specs/checkpoint-schema.md)
 - Data schema: [`docs/specs/data-schema.md`](./specs/data-schema.md)
-

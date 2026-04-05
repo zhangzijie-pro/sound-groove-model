@@ -46,64 +46,87 @@ def count_parameters(model):
     return total, trainable
 
 
+def build_scheduler(cfg: DictConfig, optimizer: torch.optim.Optimizer):
+    if not cfg.train.use_scheduler:
+        return None
+
+    warmup_epochs = int(getattr(cfg.train, "warmup_epochs", 0))
+    warmup_epochs = max(0, min(warmup_epochs, int(cfg.train.epochs) - 1))
+    if warmup_epochs <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(cfg.train.epochs),
+            eta_min=float(cfg.train.min_lr),
+        )
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=float(cfg.train.warmup_start_factor),
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, int(cfg.train.epochs) - warmup_epochs),
+        eta_min=float(cfg.train.min_lr),
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
+
+
 def build_history() -> Dict[str, list]:
     return {
         "train_loss": [],
-        "train_pit_loss": [],
-        "train_act_loss": [],
-        "train_cnt_loss": [],
-        "train_frm_loss": [],
+        "train_diar_loss": [],
+        "train_smooth_loss": [],
         "val_loss": [],
-        "val_pit_loss": [],
-        "val_act_loss": [],
-        "val_cnt_loss": [],
-        "val_frm_loss": [],
+        "val_diar_loss": [],
+        "val_smooth_loss": [],
         "val_der": [],
         "val_count_acc": [],
+        "val_act_prec": [],
+        "val_act_rec": [],
         "val_act_f1": [],
     }
 
 
 def append_history(history: Dict[str, list], train_stats: Dict[str, float], val_stats: Dict[str, float]):
     history["train_loss"].append(train_stats["loss"])
-    history["train_pit_loss"].append(train_stats["pit_loss"])
-    history["train_act_loss"].append(train_stats["act_loss"])
-    history["train_cnt_loss"].append(train_stats["cnt_loss"])
-    history["train_frm_loss"].append(train_stats["frm_loss"])
+    history["train_diar_loss"].append(train_stats["diar_loss"])
+    history["train_smooth_loss"].append(train_stats["smooth_loss"])
 
     history["val_loss"].append(val_stats["val_loss"])
-    history["val_pit_loss"].append(val_stats["pit_loss"])
-    history["val_act_loss"].append(val_stats["act_loss"])
-    history["val_cnt_loss"].append(val_stats["cnt_loss"])
-    history["val_frm_loss"].append(val_stats["frm_loss"])
+    history["val_diar_loss"].append(val_stats["diar_loss"])
+    history["val_smooth_loss"].append(val_stats["smooth_loss"])
     history["val_der"].append(val_stats["der"])
     history["val_count_acc"].append(val_stats["count_acc"])
+    history["val_act_prec"].append(val_stats["act_prec"])
+    history["val_act_rec"].append(val_stats["act_rec"])
     history["val_act_f1"].append(val_stats["act_f1"])
 
 
 def log_epoch_stats(logger, epoch: int, train_stats: Dict[str, float], val_stats: Dict[str, float], lr: float):
     logger.info(
         "[Epoch %d] LR=%.6e | "
-        "TrainLoss=%.4f | TrainPIT=%.4f | TrainACT=%.4f | TrainCNT=%.4f | TrainFRM=%.6f",
+        "TrainLoss=%.4f | TrainDiar=%.4f | TrainSmooth=%.6f",
         epoch,
         lr,
         train_stats["loss"],
-        train_stats["pit_loss"],
-        train_stats["act_loss"],
-        train_stats["cnt_loss"],
-        train_stats["frm_loss"],
+        train_stats["diar_loss"],
+        train_stats["smooth_loss"],
     )
 
     logger.info(
         "[Epoch %d] "
-        "ValLoss=%.4f | PIT=%.4f | ACT=%.4f | CNT=%.4f | FRM=%.6f | "
+        "ValLoss=%.4f | Diar=%.4f | Smooth=%.6f | "
         "DER=%.2f%% | CAcc=%.2f%% | ActF1=%.2f%%",
         epoch,
         val_stats["val_loss"],
-        val_stats["pit_loss"],
-        val_stats["act_loss"],
-        val_stats["cnt_loss"],
-        val_stats["frm_loss"],
+        val_stats["diar_loss"],
+        val_stats["smooth_loss"],
         val_stats["der"],
         val_stats["count_acc"] * 100.0,
         val_stats["act_f1"] * 100.0,
@@ -187,7 +210,11 @@ def maybe_resume_training(cfg, model, optimizer, scheduler, device, logger):
         "best_metric",
         float("inf") if cfg.output.monitor_mode == "min" else float("-inf"),
     )
-    history = ckpt.get("history", build_history())
+    loaded_history = ckpt.get("history", {})
+    history = build_history()
+    for key, value in loaded_history.items():
+        if key in history and isinstance(value, list):
+            history[key] = value
 
     logger.info("Resume checkpoint loaded from: %s", ckpt_path)
     logger.info("Resume start epoch: %d", start_epoch)
@@ -243,13 +270,7 @@ def main(cfg: DictConfig):
         weight_decay=cfg.train.weight_decay,
     )
 
-    scheduler = None
-    if cfg.train.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=cfg.train.epochs,
-            eta_min=cfg.train.min_lr,
-        )
+    scheduler = build_scheduler(cfg, optimizer)
 
     start_epoch, best_metric, history = maybe_resume_training(
         cfg, model, optimizer, scheduler, device, logger
@@ -283,9 +304,17 @@ def main(cfg: DictConfig):
             device=device,
             max_batches=cfg.validate.max_batches,
             activity_threshold=cfg.validate.activity_threshold,
+            slot_threshold=cfg.validate.slot_threshold,
+            min_active_frames=cfg.validate.min_active_frames,
+            min_slot_run=cfg.validate.min_slot_run,
+            fill_gap_frames=cfg.validate.fill_gap_frames,
+            slot_presence_frames=cfg.validate.slot_presence_frames,
             frame_quantizer=frame_quantizer if cfg.quant.apply_frame_quant_in_validate else None,
             tracker_quantizer=tracker_quantizer if cfg.quant.apply_tracker_quant else None,
             run_quant_tracker=bool(cfg.quant.run_tracker_in_validate),
+            tracker_match_threshold=cfg.validate.tracker_match_threshold,
+            tracker_momentum=cfg.validate.tracker_momentum,
+            tracker_max_misses=cfg.validate.tracker_max_misses,
         )
 
         if scheduler is not None:
@@ -339,7 +368,7 @@ def main(cfg: DictConfig):
 
         if HAS_PLOT and cfg.output.plot_history:
             try:
-                plot_curves(history, cfg.output.save_dir)
+                plot_curves(cfg.output.save_dir, history)
             except Exception as e:
                 logger.warning("plot failed: %s", e)
 

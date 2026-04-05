@@ -6,34 +6,55 @@ from speaker_verification.utils.meters import (
     AverageMeter,
     DERTracker,
     diarization_error_rate_pit,
-    compute_count_acc,
     compute_activity_metrics,
 )
-from speaker_verification.interfaces.diar_interface import ChunkInferenceResult, SlotResult
+from speaker_verification.interfaces.diar_interface import (
+    ChunkInferenceResult,
+    SlotResult,
+    build_slot_activity_masks,
+    dominant_local_ids_from_masks,
+    fill_short_inactive_gaps,
+    remove_short_active_runs,
+)
 from speaker_verification.interfaces.global_tracker import GlobalSpeakerTracker
 
 
-def _extract_pred_local_ids_and_count(slot_logits, pred_activity, pred_count, threshold=0.5):
-    """
-    slot_logits: [T, K] or [T, K+1]
-    pred_activity: [T]
-    pred_count: [K+1] logits
-    """
-    activity_prob = torch.sigmoid(pred_activity)
-    active_mask = activity_prob >= threshold
+def _extract_pred_local_ids_and_count(
+    diar_logits,
+    activity_threshold=0.5,
+    slot_threshold=0.5,
+    min_active_frames=3,
+    min_slot_run=3,
+    fill_gap_frames=3,
+    slot_presence_frames=8,
+):
+    diar_prob = torch.sigmoid(diar_logits)
+    activity_prob = diar_prob.amax(dim=-1)
+    active_mask = activity_prob >= activity_threshold
+    active_mask = fill_short_inactive_gaps(active_mask, max_gap_frames=fill_gap_frames)
+    active_mask = remove_short_active_runs(active_mask, min_active_frames=min_active_frames)
 
-    n_spk = int(pred_count.argmax(dim=0).item())
+    slot_masks = build_slot_activity_masks(
+        diar_prob=diar_prob,
+        threshold=slot_threshold,
+        min_active_frames=min_active_frames,
+        fill_gap_frames=fill_gap_frames,
+        global_activity_mask=active_mask,
+    )
+    slot_present = slot_masks.sum(dim=0) >= int(slot_presence_frames)
+    if not bool(slot_present.any().item()):
+        zeros = torch.zeros(diar_logits.size(0), dtype=torch.long, device=diar_logits.device)
+        return zeros, 0, active_mask
 
-    if slot_logits.size(-1) >= 2:
-        # 若含 silence slot，则去掉第0类
-        speaker_logits = slot_logits[:, 1:] if slot_logits.size(-1) == pred_count.numel() else slot_logits
-    else:
-        speaker_logits = slot_logits
-
-    local_ids = speaker_logits.argmax(dim=-1) + 1  # 从1开始
-    local_ids = local_ids * active_mask.long()
-
-    return local_ids, max(n_spk, 0), active_mask
+    slot_masks = slot_masks[:, slot_present]
+    slot_scores = diar_prob[:, slot_present]
+    local_ids = dominant_local_ids_from_masks(
+        slot_scores=slot_scores,
+        slot_masks=slot_masks,
+        min_run=min_slot_run,
+    )
+    n_spk = int(slot_present.sum().item())
+    return local_ids, n_spk, active_mask
 
 
 def _build_slot_results_from_frame_embeds(frame_embeds, local_frame_ids, max_slots=None):
@@ -92,17 +113,23 @@ def validate(
     device,
     max_batches=-1,
     activity_threshold=0.5,
+    slot_threshold=0.5,
+    min_active_frames=3,
+    min_slot_run=3,
+    fill_gap_frames=3,
+    slot_presence_frames=8,
     frame_quantizer=None,
     tracker_quantizer=None,
     run_quant_tracker=False,
+    tracker_match_threshold=0.72,
+    tracker_momentum=0.9,
+    tracker_max_misses=30,
 ):
     model.eval()
 
     val_loss_meter = AverageMeter()
-    pit_meter = AverageMeter()
-    act_meter = AverageMeter()
-    cnt_meter = AverageMeter()
-    frm_meter = AverageMeter()
+    diar_meter = AverageMeter()
+    smooth_meter = AverageMeter()
     der_tracker = DERTracker()
 
     count_acc_sum = 0.0
@@ -117,9 +144,9 @@ def validate(
     tracker_updates = 0
 
     tracker = GlobalSpeakerTracker(
-        match_threshold=0.72,
-        momentum=0.9,
-        max_misses=30,
+        match_threshold=tracker_match_threshold,
+        momentum=tracker_momentum,
+        max_misses=tracker_max_misses,
         device=str(device),
         quantizer=tracker_quantizer,
     ) if run_quant_tracker else None
@@ -133,22 +160,16 @@ def validate(
 
         fbank = batch["fbank"].to(device, non_blocking=True)
         target_matrix = batch["target_matrix"].to(device, non_blocking=True)
-        target_activity = batch["target_activity"].to(device, non_blocking=True)
         target_count = batch["target_count"].to(device, non_blocking=True)
         valid_mask = batch["valid_mask"].to(device, non_blocking=True)
 
-        _, frame_embeddings, slot_logits, pred_activity, pred_count = model(
-            fbank, return_diarization=True
+        frame_embeddings, diar_logits = model(
+            fbank
         )
 
         loss_dict = loss_fn(
-            frame_embeds=frame_embeddings,
-            slot_logits=slot_logits,
-            pred_activity=pred_activity,
-            pred_count=pred_count,
+            diar_logits=diar_logits,
             target_matrix=target_matrix,
-            target_activity=target_activity,
-            target_count=target_count,
             valid_mask=valid_mask,
             return_detail=True,
         )
@@ -157,25 +178,40 @@ def validate(
         bs = fbank.size(0)
 
         val_loss_meter.update(float(loss.item()), bs)
-        pit_meter.update(float(loss_dict["pit_loss"].item()), bs)
-        act_meter.update(float(loss_dict["act_loss"].item()), bs)
-        cnt_meter.update(float(loss_dict["cnt_loss"].item()), bs)
-        frm_meter.update(float(loss_dict["frm_loss"].item()), bs)
+        diar_meter.update(float(loss_dict["diar_loss"].item()), bs)
+        smooth_meter.update(float(loss_dict["smooth_loss"].item()), bs)
 
         _, info = diarization_error_rate_pit(
-            slot_logits,
+            diar_logits,
             target_matrix,
-            target_activity,
             valid_mask=valid_mask,
             return_detail=True,
         )
         der_tracker.update(info)
 
-        count_acc_sum += compute_count_acc(pred_count, target_count)
+        pred_count = []
+        diar_prob_batch = torch.sigmoid(diar_logits)
+        for b in range(bs):
+            valid_frames = valid_mask[b].bool()
+            local_ids, n_spk, _ = _extract_pred_local_ids_and_count(
+                diar_logits[b][valid_frames],
+                activity_threshold=activity_threshold,
+                slot_threshold=slot_threshold,
+                min_active_frames=min_active_frames,
+                min_slot_run=min_slot_run,
+                fill_gap_frames=fill_gap_frames,
+                slot_presence_frames=slot_presence_frames,
+            )
+            del local_ids
+            pred_count.append(n_spk)
+        pred_count = torch.tensor(pred_count, device=device)
+        count_acc_sum += (pred_count == target_count.long()).float().mean().item()
         count_acc_n += 1
 
+        target_activity = (target_matrix.sum(dim=-1) > 0).float()
+        pred_activity_logits = diar_logits.amax(dim=-1)
         ap, ar, af1 = compute_activity_metrics(
-            pred_activity, target_activity, valid_mask, threshold=activity_threshold
+            pred_activity_logits, target_activity, valid_mask, threshold=activity_threshold
         )
         act_prec_sum += ap
         act_rec_sum += ar
@@ -187,20 +223,25 @@ def validate(
 
             for b in range(bs):
                 local_ids, n_spk, _ = _extract_pred_local_ids_and_count(
-                    slot_logits[b],
-                    pred_activity[b],
-                    pred_count[b],
-                    threshold=activity_threshold,
+                    diar_logits[b][valid_mask[b].bool()],
+                    activity_threshold=activity_threshold,
+                    slot_threshold=slot_threshold,
+                    min_active_frames=min_active_frames,
+                    min_slot_run=min_slot_run,
+                    fill_gap_frames=fill_gap_frames,
+                    slot_presence_frames=slot_presence_frames,
                 )
+                padded_local_ids = torch.zeros_like(valid_mask[b], dtype=torch.long)
+                padded_local_ids[valid_mask[b].bool()] = local_ids
 
                 slots_fp = _build_slot_results_from_frame_embeds(
                     frame_embeddings[b].detach().cpu(),
-                    local_ids.detach().cpu(),
+                    padded_local_ids.detach().cpu(),
                     max_slots=max(n_spk, 1),
                 )
                 slots_q = _build_slot_results_from_frame_embeds(
                     frame_embeddings_q[b].detach().cpu(),
-                    local_ids.detach().cpu(),
+                    padded_local_ids.detach().cpu(),
                     max_slots=max(n_spk, 1),
                 )
 
@@ -214,11 +255,11 @@ def validate(
                         num_speakers=len(slots_q),
                         dominant_speaker=f"slot_{slots_q[0].slot}" if len(slots_q) > 0 else None,
                         dominant_speaker_slot=slots_q[0].slot if len(slots_q) > 0 else None,
-                        activity_ratio=float((local_ids > 0).float().mean().item()),
+                        activity_ratio=float((padded_local_ids > 0).float().mean().item()),
                         slots=slots_q,
                         segments=[],
-                        frame_activity_prob=torch.sigmoid(pred_activity[b]).detach().cpu(),
-                        local_frame_ids=local_ids.detach().cpu(),
+                        frame_activity_prob=torch.sigmoid(pred_activity_logits[b]).detach().cpu(),
+                        local_frame_ids=padded_local_ids.detach().cpu(),
                         global_frame_ids=None,
                     )
                     _ = tracker.update(chunk_result)
@@ -236,10 +277,8 @@ def validate(
 
     out = {
         "val_loss": val_loss_meter.avg,
-        "pit_loss": pit_meter.avg,
-        "act_loss": act_meter.avg,
-        "cnt_loss": cnt_meter.avg,
-        "frm_loss": frm_meter.avg,
+        "diar_loss": diar_meter.avg,
+        "smooth_loss": smooth_meter.avg,
         "der": der_detail["der"] * 100.0,
         "der_detail": {
             "fa": der_detail["fa"],

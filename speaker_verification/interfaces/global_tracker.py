@@ -35,13 +35,13 @@ class GlobalSpeakerTracker:
         momentum: float = 0.9,
         max_misses: int = 30,
         device: str = "cpu",
-        # quantizer = None
+        quantizer=None,
     ):
         self.match_threshold = float(match_threshold)
         self.momentum = float(momentum)
         self.max_misses = int(max_misses)
         self.device = torch.device(device)
-        # self.quantizer = quantizer
+        self.quantizer = quantizer
         
         self.tracks: Dict[int, Track] = {}
         self.next_global_id = 1
@@ -144,7 +144,7 @@ class GlobalSpeakerTracker:
                 matched_gids.add(gid)
         else:
             gids = list(self.tracks.keys())
-            bank = torch.stack([self.tracks[gid].prototype for gid in gids], dim=0)
+            bank = torch.stack([self._decode_proto(self.tracks[gid]) for gid in gids], dim=0)
             sim = self._sim(cur_protos, bank)
             row_ind, col_ind = linear_sum_assignment((1.0 - sim).detach().cpu().numpy())
 
@@ -170,7 +170,7 @@ class GlobalSpeakerTracker:
         self._age_unmatched(matched_gids)
 
         global_frame_ids = self._build_global_frame_ids(result.local_frame_ids, local_to_global)
-        active_global_ids = sorted(set(global_frame_ids.tolist()) - {0})
+        active_global_ids = sorted(set(local_to_global.values()))
 
         dominant_global_id = None
         if result.dominant_speaker_slot is not None:

@@ -6,6 +6,7 @@ from speaker_verification.interfaces.diar_interface import (
     frames_to_segments,
     merge_similar_slots,
     remove_short_active_runs,
+    slot_masks_to_segments,
     smooth_sequence,
 )
 
@@ -49,3 +50,29 @@ def test_merge_similar_slots_and_segments():
     assert segments[0].start_sec == 1.1
     assert segments[0].end_sec == 1.3
     assert segments[1].name == "speaker_b"
+
+
+def test_slot_masks_to_segments_supports_overlap():
+    slot_masks = torch.tensor(
+        [
+            [False, False],
+            [True, False],
+            [True, True],
+            [False, True],
+        ],
+        dtype=torch.bool,
+    )
+    segments = slot_masks_to_segments(
+        slot_masks,
+        frame_shift_sec=0.1,
+        slot_to_name={1: "speaker_a", 2: "speaker_b"},
+        offset_sec=2.0,
+    )
+
+    assert len(segments) == 2
+    assert segments[0].slot == 1
+    assert segments[0].start_sec == 2.1
+    assert segments[0].end_sec == 2.3
+    assert segments[1].slot == 2
+    assert segments[1].start_sec == 2.2
+    assert segments[1].end_sec == 2.4

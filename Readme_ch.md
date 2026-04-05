@@ -62,16 +62,10 @@ bank.add_speaker(
 )
 
 fbank = torch.randn(1, 400, 80)
-global_emb, frame_embeds, slot_logits, activity_logits, count_logits = model(
-    fbank,
-    return_diarization=True,
-)
+frame_embeds, diar_logits = model(fbank)
 
-print("global_emb", tuple(global_emb.shape))
 print("frame_embeds", tuple(frame_embeds.shape))
-print("slot_logits", tuple(slot_logits.shape))
-print("activity_logits", tuple(activity_logits.shape))
-print("count_logits", tuple(count_logits.shape))
+print("diar_logits", tuple(diar_logits.shape))
 print("speaker_bank_size", len(bank.list_speakers()))
 ```
 
@@ -135,4 +129,3 @@ python3 examples/long_audio_monitoring.py \
 ## License
 
 Apache License 2.0。外部数据集如 CN-Celeb 仍遵循其原始许可证和使用条款。
-

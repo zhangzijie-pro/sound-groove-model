@@ -6,19 +6,16 @@ model:
   channels: 512
   embedding_dim: 256
   max_mix_speakers: 4
+  post_ffn_hidden_dim: 1024
+  post_ffn_dropout: 0.1
+  head_dropout: 0.1
 
 loss:
-  lambda_pit: 1.0
-  lambda_act: 1.0
-  lambda_cnt: 0.2
-  lambda_frm: 0.15
-  pos_weight: 2.0
-  pit_pos_weight: 1.5
-  proto_eps: 1.0e-8
-  proto_temperature: 0.07
+  pit_pos_weight: 2.25
+  lambda_smooth: 0.03
 
 data:
-  out_dir: "processed/static_mix_cnceleb2"
+  out_dir: "processed/static_mix_cnceleb2_v3"
   train_manifest: "train_manifest.jsonl"
   val_manifest: "val_manifest.jsonl"
   crop_sec: 4.0
@@ -26,23 +23,33 @@ data:
 train:
   seed: 42
   device: "cuda"
-  epochs: 100
-  batch_size: 16
-  num_workers: 2
-  lr: 3.0e-4
-  min_lr: 1.0e-6
-  weight_decay: 1.0e-4
-  grad_clip: 5.0
+  epochs: 140
+  batch_size: 12
+  num_workers: 4
+  lr: 2.0e-4
+  min_lr: 5.0e-6
+  warmup_epochs: 5
+  warmup_start_factor: 0.2
+  weight_decay: 5.0e-5
+  grad_clip: 3.0
   use_scheduler: true
 
 validate:
-  batch_size: 64
+  batch_size: 32
   max_batches: -1
-  activity_threshold: 0.5
+  activity_threshold: 0.42
+  slot_threshold: 0.45
+  min_active_frames: 4
+  min_slot_run: 3
+  fill_gap_frames: 6
+  slot_presence_frames: 8
+  tracker_match_threshold: 0.68
+  tracker_momentum: 0.92
+  tracker_max_misses: 40
 
 output:
   save_dir: "outputs/default"
-  monitor: "val_loss"      # choice: val_loss / der / act_f1
+  monitor: "der"           # choice: val_loss / der / act_f1
   monitor_mode: "min"      # min | max
   plot_history: true
 

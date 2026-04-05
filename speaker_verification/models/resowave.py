@@ -93,6 +93,7 @@ class ResoWave(nn.Module):
         max_mix_speakers=5,
         post_ffn_hidden_dim=None,
         post_ffn_dropout=0.1,
+        head_dropout=0.1,
         **kwargs,
     ):
         super().__init__()
@@ -128,11 +129,17 @@ class ResoWave(nn.Module):
             in_dim=channels,
             emb_dim=embedding_dim,
             num_speakers_max=max_mix_speakers,
+            dropout=head_dropout,
         )
 
-    def forward(self, x, return_diarization=False):
+    def forward(self, x):
         """
-        x: [B,T,80]
+        Args:
+            x: [B, T, 80] log-fbank sequence.
+
+        Returns:
+            frame_embeds: [B, T, D] normalized frame-level speaker embeddings.
+            diar_logits: [B, T, K] frame-wise speaker activity logits.
         """
         x = x.transpose(1, 2)  # [B,80,T]
 
@@ -143,9 +150,6 @@ class ResoWave(nn.Module):
 
         frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
         frame_feat = self.post_out4_ffn(frame_feat)
-        frame_embeds, slot_logits, activity_logits, count_logits = self.diar_head(frame_feat)
-        global_emb = F.normalize(frame_embeds.mean(dim=1), p=2, dim=-1)
+        frame_embeds, diar_logits = self.diar_head(frame_feat)
 
-        if return_diarization:
-            return global_emb, frame_embeds, slot_logits, activity_logits, count_logits
-        return global_emb
+        return frame_embeds, diar_logits

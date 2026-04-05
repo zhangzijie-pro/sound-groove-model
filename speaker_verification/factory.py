@@ -10,23 +10,19 @@ def build_model(cfg, device):
     model = ResoWave(
         in_channels=cfg.model.in_channels,
         channels=cfg.model.channels,
-        embd_dim=cfg.model.embedding_dim,
+        embedding_dim=cfg.model.embedding_dim,
         max_mix_speakers=cfg.model.max_mix_speakers,
+        post_ffn_hidden_dim=cfg.model.post_ffn_hidden_dim,
+        post_ffn_dropout=cfg.model.post_ffn_dropout,
+        head_dropout=cfg.model.head_dropout,
     )
     return model.to(device)
 
 
 def build_loss(cfg, device):
     loss_fn = MultiTaskLoss(
-        max_spk=cfg.model.max_mix_speakers,
-        lambda_pit=cfg.loss.lambda_pit,
-        lambda_act=cfg.loss.lambda_act,
-        lambda_cnt=cfg.loss.lambda_cnt,
-        lambda_frm=cfg.loss.lambda_frm,
-        pos_weight=cfg.loss.pos_weight,
         pit_pos_weight=cfg.loss.pit_pos_weight,
-        proto_eps=cfg.loss.proto_eps,
-        proto_temperature=cfg.loss.proto_temperature,
+        lambda_smooth=cfg.loss.lambda_smooth,
     )
     return loss_fn.to(device)
 

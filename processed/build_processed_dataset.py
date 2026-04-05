@@ -14,11 +14,6 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-try:
-    import torchaudio
-except ImportError:
-    torchaudio = None
-
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -153,6 +148,28 @@ def backup_metadata_files(cfg: "BuildCfg", output_root: str, paths: Iterable[str
     backup_files(paths, output_root=output_root, backup_dir_name=cfg.backup_dir_name, backup_tag=cfg.backup_tag)
 
 
+def ensure_static_mix_compatibility(cfg: "BuildCfg"):
+    meta_path = Path(cfg.static_out_dir) / "mix_meta.json"
+    if not cfg.incremental or not meta_path.is_file():
+        return
+    meta = load_json(str(meta_path))
+    expected = {
+        "label_mode": "framewise_speech_mask",
+        "mix_domain": "linear_mel_energy",
+    }
+    mismatched = {
+        key: {"existing": meta.get(key), "expected": value}
+        for key, value in expected.items()
+        if meta.get(key) != value
+    }
+    if mismatched:
+        raise RuntimeError(
+            "Existing static mix directory was built with an older preprocessing schema. "
+            f"Use a new static_out_dir or clean {cfg.static_out_dir} before incremental rebuild. "
+            f"Mismatched meta: {mismatched}"
+        )
+
+
 def safe_key(path: str, root: str) -> str:
     rel = os.path.relpath(path, root).replace("\\", "/")
     return os.path.splitext(rel)[0].replace("/", "__")
@@ -160,6 +177,10 @@ def safe_key(path: str, root: str) -> str:
 
 def db_to_gain(db: float) -> float:
     return 10 ** (db / 20.0)
+
+
+def db_to_power_gain(db: float) -> float:
+    return 10 ** (db / 10.0)
 
 
 def list_pt_files(root: str) -> List[str]:
@@ -171,6 +192,256 @@ def list_pt_files(root: str) -> List[str]:
             if f.lower().endswith(".pt"):
                 out.append(os.path.join(r, f))
     return out
+
+
+def smooth_curve_1d(x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    if kernel_size <= 1 or x.numel() <= 2:
+        return x
+    kernel_size = max(1, int(kernel_size))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    pad = kernel_size // 2
+    y = x.view(1, 1, -1)
+    y = F.pad(y, (pad, pad), mode="replicate")
+    weight = torch.ones(1, 1, kernel_size, dtype=x.dtype, device=x.device) / kernel_size
+    return F.conv1d(y, weight).view(-1)
+
+
+def remove_short_true_runs(mask: torch.Tensor, min_len: int) -> torch.Tensor:
+    if mask.numel() == 0 or min_len <= 1:
+        return mask
+    out = mask.clone()
+    t = 0
+    total = out.numel()
+    while t < total:
+        if not bool(out[t].item()):
+            t += 1
+            continue
+        end = t + 1
+        while end < total and bool(out[end].item()):
+            end += 1
+        if end - t < min_len:
+            out[t:end] = False
+        t = end
+    return out
+
+
+def fill_short_false_runs(mask: torch.Tensor, max_gap: int) -> torch.Tensor:
+    if mask.numel() == 0 or max_gap <= 0:
+        return mask
+    out = mask.clone()
+    t = 0
+    total = out.numel()
+    while t < total:
+        if bool(out[t].item()):
+            t += 1
+            continue
+        end = t + 1
+        while end < total and not bool(out[end].item()):
+            end += 1
+        left_active = t > 0 and bool(out[t - 1].item())
+        right_active = end < total and bool(out[end].item())
+        if left_active and right_active and (end - t) <= max_gap:
+            out[t:end] = True
+        t = end
+    return out
+
+
+def estimate_speech_mask_from_fbank(
+    feat: torch.Tensor,
+    threshold_ratio: float,
+    smooth_frames: int,
+    min_speech_frames: int,
+    fill_gap_frames: int,
+) -> torch.Tensor:
+    if feat.dim() != 2:
+        raise ValueError(f"Expected [T,F] fbank, got {tuple(feat.shape)}")
+    if feat.size(0) == 0:
+        return torch.zeros(0, dtype=torch.bool)
+
+    energy = feat.float().mean(dim=-1)
+    energy = smooth_curve_1d(energy, kernel_size=smooth_frames)
+    lo = torch.quantile(energy, 0.10)
+    hi = torch.quantile(energy, 0.95)
+    span = float((hi - lo).item())
+    if span < 1e-6:
+        return torch.ones(feat.size(0), dtype=torch.bool)
+
+    threshold = lo + float(threshold_ratio) * (hi - lo)
+    mask = energy >= threshold
+    mask = fill_short_false_runs(mask, max_gap=int(fill_gap_frames))
+    mask = remove_short_true_runs(mask, min_len=int(min_speech_frames))
+    if not bool(mask.any().item()):
+        peak_index = int(torch.argmax(energy).item())
+        mask[max(0, peak_index - 1): min(mask.numel(), peak_index + 2)] = True
+    return mask
+
+
+def align_mask_length(mask: torch.Tensor, target_len: int) -> torch.Tensor:
+    mask = mask.bool().view(-1)
+    if mask.numel() == target_len:
+        return mask
+    if mask.numel() > target_len:
+        return mask[:target_len]
+    out = torch.zeros(target_len, dtype=torch.bool)
+    out[: mask.numel()] = mask
+    return out
+
+
+def log_fbank_to_linear(feat: torch.Tensor) -> torch.Tensor:
+    return torch.exp(feat.float())
+
+
+def linear_fbank_to_log(feat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return torch.log(torch.clamp(feat.float(), min=eps))
+
+
+def finalize_pack(fbank: torch.Tensor, target_matrix: torch.Tensor, spk_label: int, **extra: Any) -> Dict[str, Any]:
+    fbank = fbank.float().cpu()
+    target_matrix = target_matrix.float().cpu()
+    target_activity = (target_matrix.sum(dim=-1) > 0).float()
+    target_count = int((target_matrix.sum(dim=0) > 0).sum().item())
+    pack = {
+        "fbank": fbank,
+        "spk_label": int(spk_label),
+        "target_matrix": target_matrix,
+        "target_activity": target_activity,
+        "target_count": target_count,
+    }
+    pack.update(extra)
+    return pack
+
+
+def load_single_speaker_feat_pack(
+    path: str,
+    cfg: "BuildCfg",
+    feat_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    norm_path = os.path.normpath(path)
+    if feat_cache is not None and norm_path in feat_cache:
+        return feat_cache[norm_path]
+
+    obj = torch.load(norm_path, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict):
+        feat = obj["fbank"] if "fbank" in obj else next(v for v in obj.values() if torch.is_tensor(v))
+        wav_path = obj.get("wav_path")
+        speaker = obj.get("speaker")
+    else:
+        feat = obj
+        wav_path = None
+        speaker = None
+
+    if not torch.is_tensor(feat):
+        feat = torch.tensor(feat)
+    feat = feat.float().cpu()
+    if feat.dim() == 3 and feat.size(0) == 1:
+        feat = feat[0]
+    if feat.dim() != 2:
+        raise ValueError(f"Unexpected feat shape {tuple(feat.shape)}: {path}")
+    if feat.size(1) != cfg.n_mels and feat.size(0) == cfg.n_mels:
+        feat = feat.transpose(0, 1)
+    if feat.size(1) != cfg.n_mels:
+        raise ValueError(f"Expected n_mels={cfg.n_mels}, got {tuple(feat.shape)}: {path}")
+
+    speech_mask = obj.get("speech_mask") if isinstance(obj, dict) else None
+    if speech_mask is None:
+        speech_mask = estimate_speech_mask_from_fbank(
+            feat,
+            threshold_ratio=cfg.vad_threshold_ratio,
+            smooth_frames=cfg.vad_smooth_frames,
+            min_speech_frames=cfg.vad_min_speech_frames,
+            fill_gap_frames=cfg.vad_fill_gap_frames,
+        )
+    else:
+        if not torch.is_tensor(speech_mask):
+            speech_mask = torch.tensor(speech_mask)
+        speech_mask = align_mask_length(speech_mask.bool().cpu(), feat.size(0))
+
+    record = {
+        "fbank": feat,
+        "speech_mask": speech_mask,
+        "wav_path": wav_path,
+        "speaker": speaker,
+    }
+    if feat_cache is not None and feat.size(0) <= 1600:
+        feat_cache[norm_path] = record
+    return record
+
+
+def choose_segment_frames(
+    total_frames: int,
+    crop_frames: int,
+    min_ratio: float,
+    max_ratio: float,
+) -> int:
+    max_frames = min(total_frames, crop_frames)
+    min_frames = max(8, int(round(crop_frames * min_ratio)))
+    max_target = max(min_frames, int(round(crop_frames * max_ratio)))
+    max_frames = min(max_frames, max_target)
+    min_frames = min(min_frames, max_frames)
+    return random.randint(min_frames, max_frames)
+
+
+def sample_feature_segment(
+    feat: torch.Tensor,
+    speech_mask: torch.Tensor,
+    crop_frames: int,
+    min_ratio: float,
+    max_ratio: float,
+    min_speech_frames: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    total_frames = feat.size(0)
+    seg_frames = choose_segment_frames(total_frames, crop_frames, min_ratio=min_ratio, max_ratio=max_ratio)
+    if total_frames <= seg_frames:
+        return feat, align_mask_length(speech_mask, feat.size(0))
+
+    best_start = 0
+    best_active = -1
+    for _ in range(10):
+        start = random.randint(0, total_frames - seg_frames)
+        candidate_mask = speech_mask[start:start + seg_frames]
+        active = int(candidate_mask.sum().item())
+        if active > best_active:
+            best_start = start
+            best_active = active
+        if active >= min_speech_frames:
+            best_start = start
+            break
+    end = best_start + seg_frames
+    return feat[best_start:end], speech_mask[best_start:end]
+
+
+def sample_destination_start(
+    canvas_frames: int,
+    seg_frames: int,
+    allow_overlap: bool,
+    max_offset_ratio: float,
+    occupied_mask: Optional[torch.Tensor] = None,
+) -> int:
+    if seg_frames >= canvas_frames:
+        return 0
+
+    max_start = canvas_frames - seg_frames
+    if occupied_mask is None or allow_overlap or not bool(occupied_mask.any().item()):
+        center = max_start // 2
+        radius = min(max_start, int(round(canvas_frames * max_offset_ratio)))
+        lo = max(0, center - radius)
+        hi = min(max_start, center + radius)
+        if lo > hi:
+            lo, hi = 0, max_start
+        return random.randint(lo, hi)
+
+    best_start = 0
+    best_overlap = None
+    for _ in range(16):
+        start = random.randint(0, max_start)
+        overlap = int(occupied_mask[start:start + seg_frames].sum().item())
+        if best_overlap is None or overlap < best_overlap:
+            best_start = start
+            best_overlap = overlap
+            if overlap == 0:
+                break
+    return best_start
 
 
 # =========================================================
@@ -194,8 +465,13 @@ class BuildCfg:
     target_sr: int = 16000
     n_mels: int = 80
     min_sec: float = 1.0
+    min_speech_ratio_per_utt: float = 0.08
     val_utt_ratio: float = 0.1
     min_utts_per_spk: int = 2
+    vad_threshold_ratio: float = 0.22
+    vad_smooth_frames: int = 5
+    vad_min_speech_frames: int = 4
+    vad_fill_gap_frames: int = 6
 
     # static mix
     static_out_dir: str = "../processed/static_mix_cnceleb2"
@@ -212,12 +488,18 @@ class BuildCfg:
     noise_snr_max: float = 0.0
     allow_overlap: bool = True
     max_offset_ratio: float = 0.35
+    mix_source_dur_min_ratio: float = 0.35
+    mix_source_dur_max_ratio: float = 0.95
+    mix_use_augmented_sources: bool = False
 
     # add single
     add_single_train: int = 3000
     add_single_val: int = 500
     add_single_subdir: str = "single_from_cnceleb2"
     skip_existing: bool = True
+    single_source_dur_min_ratio: float = 0.35
+    single_source_dur_max_ratio: float = 0.95
+    single_max_pad_ratio: float = 0.40
 
     # add negative
     add_neg_train: int = 2000
@@ -315,10 +597,22 @@ def preprocess_cn_celeb2(cfg: BuildCfg):
                     num_crops=1,
                     crop_sec=max(cfg.min_sec, float(len(wav)) / cfg.target_sr),
                 )[0]
+                speech_mask = estimate_speech_mask_from_fbank(
+                    feat,
+                    threshold_ratio=cfg.vad_threshold_ratio,
+                    smooth_frames=cfg.vad_smooth_frames,
+                    min_speech_frames=cfg.vad_min_speech_frames,
+                    fill_gap_frames=cfg.vad_fill_gap_frames,
+                )
+                speech_ratio = float(speech_mask.float().mean().item())
+                if speech_ratio < cfg.min_speech_ratio_per_utt:
+                    continue
 
                 torch.save(
                     {
                         "fbank": feat,
+                        "speech_mask": speech_mask,
+                        "speech_ratio": speech_ratio,
                         "speaker": spk,
                         "spk_id": int(spk2id[spk]),
                         "wav_path": normalize_path(wav_path),
@@ -561,8 +855,17 @@ def build_augmented_cn_lists(cfg: BuildCfg, split: str, num_aug_per_utt: int):
                 continue
 
             aug_feat, aug_meta = augment_fbank(feat)
+            aug_speech_mask = estimate_speech_mask_from_fbank(
+                aug_feat,
+                threshold_ratio=cfg.vad_threshold_ratio,
+                smooth_frames=cfg.vad_smooth_frames,
+                min_speech_frames=cfg.vad_min_speech_frames,
+                fill_gap_frames=cfg.vad_fill_gap_frames,
+            )
             aug_obj = dict(obj)
             aug_obj["fbank"] = aug_feat
+            aug_obj["speech_mask"] = aug_speech_mask
+            aug_obj["speech_ratio"] = float(aug_speech_mask.float().mean().item())
             aug_obj["source"] = "augmented_cn_single"
             aug_obj["aug_index"] = k
             aug_obj["aug_version"] = cfg.augmentation_version
@@ -624,33 +927,10 @@ def load_feat_any(path: str, target_sr: int = 16000, n_mels: int = 80) -> torch.
         return feat
 
     wav = load_wav_mono(path, target_sr=target_sr)
-    feat = wav_to_fbank(wav, n_mels=n_mels)
+    feat = wav_to_fbank(wav, n_mels=n_mels)[0]
     if not torch.is_tensor(feat):
         feat = torch.tensor(feat)
     return feat.float().cpu()
-
-
-def crop_or_pad_feat(x: torch.Tensor, crop_frames: int) -> torch.Tensor:
-    T = x.size(0)
-    if T >= crop_frames:
-        s = random.randint(0, T - crop_frames)
-        return x[s:s + crop_frames]
-    return F.pad(x, (0, 0, 0, crop_frames - T))
-
-
-def build_segment_with_offset(crop_frames: int, allow_overlap: bool, max_offset_ratio: float):
-    max_shift = int(crop_frames * max_offset_ratio) if allow_overlap else 0
-    offset = random.randint(-max_shift, max_shift) if max_shift > 0 else 0
-
-    src_s0 = 0
-    dst_s0 = offset
-    if dst_s0 < 0:
-        src_s0 = -dst_s0
-        dst_s0 = 0
-
-    length = crop_frames - dst_s0
-    length = min(length, crop_frames - src_s0)
-    return src_s0, dst_s0, length
 
 
 def generate_one_mix(
@@ -658,7 +938,7 @@ def generate_one_mix(
     spk_to_utters: Dict[str, List[str]],
     spk2id: Dict[str, int],
     cfg: BuildCfg,
-    feat_cache: Dict[str, torch.Tensor],
+    feat_cache: Dict[str, Dict[str, Any]],
     noise_pts: List[str],
 ):
     crop_frames = int(cfg.crop_sec * 100)
@@ -666,50 +946,68 @@ def generate_one_mix(
     spks = random.sample(speakers, k)
     sv_spk = random.choice(spks)
 
-    mixed = torch.zeros(crop_frames, cfg.n_mels, dtype=torch.float32)
+    mixed_linear = torch.zeros(crop_frames, cfg.n_mels, dtype=torch.float32)
     target_matrix = torch.zeros(crop_frames, cfg.max_mix, dtype=torch.float32)
-    target_activity = torch.zeros(crop_frames, dtype=torch.float32)
+    occupied_mask = torch.zeros(crop_frames, dtype=torch.bool)
 
-    def get_feat(p: str):
-        p = os.path.normpath(p)
-        if p in feat_cache:
-            return feat_cache[p]
-        feat = load_feat_any(p, target_sr=cfg.target_sr, n_mels=cfg.n_mels)
-        if feat.size(0) <= 800:
-            feat_cache[p] = feat
-        return feat
+    def get_source(p: str) -> Dict[str, Any]:
+        return load_single_speaker_feat_pack(p, cfg=cfg, feat_cache=feat_cache)
 
     for local_slot, spk in enumerate(spks):
         utt = random.choice(spk_to_utters[spk])
-        feat = crop_or_pad_feat(get_feat(utt), crop_frames)
-        gain = db_to_gain(random.uniform(cfg.spk_snr_min, cfg.spk_snr_max))
-
-        src_s0, dst_s0, length = build_segment_with_offset(
+        source = get_source(utt)
+        feat_seg, speech_mask_seg = sample_feature_segment(
+            feat=source["fbank"],
+            speech_mask=source["speech_mask"],
             crop_frames=crop_frames,
-            allow_overlap=cfg.allow_overlap,
-            max_offset_ratio=cfg.max_offset_ratio,
+            min_ratio=cfg.mix_source_dur_min_ratio,
+            max_ratio=cfg.mix_source_dur_max_ratio,
+            min_speech_frames=cfg.vad_min_speech_frames,
         )
-        if length <= 0:
+        seg_frames = int(feat_seg.size(0))
+        if seg_frames <= 0:
             continue
 
-        seg = feat[src_s0:src_s0 + length] * gain
-        mixed[dst_s0:dst_s0 + length] += seg
-        target_matrix[dst_s0:dst_s0 + length, local_slot] = 1.0
-        target_activity[dst_s0:dst_s0 + length] = 1.0
+        dst_s0 = sample_destination_start(
+            canvas_frames=crop_frames,
+            seg_frames=seg_frames,
+            allow_overlap=cfg.allow_overlap,
+            max_offset_ratio=cfg.max_offset_ratio,
+            occupied_mask=occupied_mask,
+        )
+        dst_e0 = min(crop_frames, dst_s0 + seg_frames)
+        seg_frames = dst_e0 - dst_s0
+        if seg_frames <= 0:
+            continue
+
+        feat_seg = feat_seg[:seg_frames]
+        speech_mask_seg = align_mask_length(speech_mask_seg, seg_frames)
+        power_gain = db_to_power_gain(random.uniform(cfg.spk_snr_min, cfg.spk_snr_max))
+        mixed_linear[dst_s0:dst_e0] += log_fbank_to_linear(feat_seg) * power_gain
+        target_matrix[dst_s0:dst_e0, local_slot] = torch.maximum(
+            target_matrix[dst_s0:dst_e0, local_slot],
+            speech_mask_seg.float(),
+        )
+        occupied_mask[dst_s0:dst_e0] |= speech_mask_seg
 
     if noise_pts and random.random() < cfg.noise_prob:
         npt = random.choice(noise_pts)
-        nfeat = crop_or_pad_feat(load_feat_any(npt, target_sr=cfg.target_sr, n_mels=cfg.n_mels), crop_frames)
-        mixed += nfeat * db_to_gain(random.uniform(cfg.noise_snr_min, cfg.noise_snr_max))
+        nfeat = load_feat_any(npt, target_sr=cfg.target_sr, n_mels=cfg.n_mels)
+        if nfeat.size(0) > crop_frames:
+            start = random.randint(0, nfeat.size(0) - crop_frames)
+            nfeat = nfeat[start:start + crop_frames]
+        elif nfeat.size(0) < crop_frames:
+            nfeat = F.pad(nfeat, (0, 0, 0, crop_frames - nfeat.size(0)))
+        noise_gain = db_to_power_gain(random.uniform(cfg.noise_snr_min, cfg.noise_snr_max))
+        mixed_linear += log_fbank_to_linear(nfeat) * noise_gain
 
-    return {
-        "fbank": mixed,
-        "spk_label": int(spk2id[sv_spk]),
-        "target_matrix": target_matrix,
-        "target_activity": target_activity,
-        "target_count": int(k),
-        "speaker_names": spks,
-    }
+    mixed = linear_fbank_to_log(mixed_linear)
+    return finalize_pack(
+        fbank=mixed,
+        target_matrix=target_matrix,
+        spk_label=int(spk2id[sv_spk]),
+        speaker_names=spks,
+    )
 
 
 def generate_mix_split(
@@ -730,7 +1028,7 @@ def generate_mix_split(
     ensure_dir(mix_dir)
 
     manifest_path = static_out_dir / f"{split_name}_manifest.jsonl"
-    feat_cache: Dict[str, torch.Tensor] = {}
+    feat_cache: Dict[str, Dict[str, Any]] = {}
     existing_items = load_jsonl(str(manifest_path))
     existing_relpts = {normalize_path(item["pt"]) for item in existing_items if "pt" in item}
     start_idx = len(existing_items) if cfg.incremental else 0
@@ -762,12 +1060,21 @@ def generate_mix_split(
 
 def build_static_mix(cfg: BuildCfg):
     set_seed(cfg.seed)
+    ensure_static_mix_compatibility(cfg)
 
     train_map_path_aug = os.path.join(cfg.cn_out_dir, "spk_to_utterances_train_aug.json")
     val_map_path_aug = os.path.join(cfg.cn_out_dir, "spk_to_utterances_val_aug.json")
 
-    train_map_path = train_map_path_aug if os.path.isfile(train_map_path_aug) else os.path.join(cfg.cn_out_dir, "spk_to_utterances_train.json")
-    val_map_path = val_map_path_aug if os.path.isfile(val_map_path_aug) else os.path.join(cfg.cn_out_dir, "spk_to_utterances_val.json")
+    if cfg.mix_use_augmented_sources and os.path.isfile(train_map_path_aug) and os.path.isfile(val_map_path_aug):
+        train_map_path = train_map_path_aug
+        val_map_path = val_map_path_aug
+    else:
+        train_map_path = os.path.join(cfg.cn_out_dir, "spk_to_utterances_train.json")
+        val_map_path = os.path.join(cfg.cn_out_dir, "spk_to_utterances_val.json")
+        if not os.path.isfile(train_map_path) and os.path.isfile(train_map_path_aug):
+            train_map_path = train_map_path_aug
+        if not os.path.isfile(val_map_path) and os.path.isfile(val_map_path_aug):
+            val_map_path = val_map_path_aug
 
     spk2id_path = os.path.join(cfg.cn_out_dir, "spk2id.json")
 
@@ -806,6 +1113,11 @@ def build_static_mix(cfg: BuildCfg):
             "noise_snr_max": cfg.noise_snr_max,
             "allow_overlap": cfg.allow_overlap,
             "max_offset_ratio": cfg.max_offset_ratio,
+            "mix_source_dur_min_ratio": cfg.mix_source_dur_min_ratio,
+            "mix_source_dur_max_ratio": cfg.mix_source_dur_max_ratio,
+            "mix_use_augmented_sources": cfg.mix_use_augmented_sources,
+            "label_mode": "framewise_speech_mask",
+            "mix_domain": "linear_mel_energy",
             "seed": cfg.seed,
             "incremental": cfg.incremental,
             "augmentation_version": cfg.augmentation_version,
@@ -842,30 +1154,42 @@ def collect_cn_single_items(cn_out_dir: str, split: str) -> List[Tuple[int, str]
     return load_txt_pairs(list_path)
 
 
-def build_single_pack_from_cn_pt(cn_pt_path: str, spk_id: int, max_mix: int):
-    obj = torch.load(cn_pt_path, map_location="cpu", weights_only=False)
-    fbank = obj["fbank"]
-    if not torch.is_tensor(fbank):
-        fbank = torch.tensor(fbank)
-    fbank = fbank.float().cpu()
-    T = int(fbank.shape[0])
+def build_single_pack_from_cn_pt(cn_pt_path: str, spk_id: int, max_mix: int, cfg: BuildCfg):
+    source = load_single_speaker_feat_pack(cn_pt_path, cfg=cfg)
+    crop_frames = int(cfg.crop_sec * 100)
+    feat_seg, speech_mask_seg = sample_feature_segment(
+        feat=source["fbank"],
+        speech_mask=source["speech_mask"],
+        crop_frames=crop_frames,
+        min_ratio=cfg.single_source_dur_min_ratio,
+        max_ratio=cfg.single_source_dur_max_ratio,
+        min_speech_frames=cfg.vad_min_speech_frames,
+    )
 
-    target_matrix = torch.zeros(T, max_mix, dtype=torch.float32)
-    target_matrix[:, 0] = 1.0
+    canvas = torch.zeros(crop_frames, cfg.n_mels, dtype=torch.float32)
+    target_matrix = torch.zeros(crop_frames, max_mix, dtype=torch.float32)
+    start = sample_destination_start(
+        canvas_frames=crop_frames,
+        seg_frames=int(feat_seg.size(0)),
+        allow_overlap=True,
+        max_offset_ratio=cfg.single_max_pad_ratio,
+        occupied_mask=None,
+    )
+    end = min(crop_frames, start + int(feat_seg.size(0)))
+    seg_len = end - start
+    if seg_len > 0:
+        canvas[start:end] = feat_seg[:seg_len]
+        target_matrix[start:end, 0] = align_mask_length(speech_mask_seg, seg_len).float()
 
-    pack = {
-        "fbank": fbank,
-        "spk_label": int(spk_id),
-        "target_matrix": target_matrix,
-        "target_activity": torch.ones(T, dtype=torch.float32),
-        "target_count": 1,
-        "source": "cn_celeb2_single",
-    }
-    if "speaker" in obj:
-        pack["speaker_name"] = obj["speaker"]
-    if "wav_path" in obj:
-        pack["wav_path"] = obj["wav_path"]
-    return pack
+    return finalize_pack(
+        fbank=canvas,
+        target_matrix=target_matrix,
+        spk_label=int(spk_id),
+        source="cn_celeb2_single",
+        speaker_name=source.get("speaker"),
+        wav_path=source.get("wav_path"),
+        source_pt=normalize_path(cn_pt_path),
+    )
 
 
 def get_existing_relpts(static_mix_dir: str, manifest_name: str) -> set:
@@ -874,6 +1198,7 @@ def get_existing_relpts(static_mix_dir: str, manifest_name: str) -> set:
 
 def append_single_samples(cfg: BuildCfg):
     set_seed(cfg.seed)
+    ensure_static_mix_compatibility(cfg)
 
     train_manifest = Path(cfg.static_out_dir) / "train_manifest.jsonl"
     val_manifest = Path(cfg.static_out_dir) / "val_manifest.jsonl"
@@ -903,7 +1228,7 @@ def append_single_samples(cfg: BuildCfg):
                 if cfg.skip_existing and rel_pt in existing:
                     continue
 
-                pack = build_single_pack_from_cn_pt(cn_pt_path, spk_id, max_mix)
+                pack = build_single_pack_from_cn_pt(cn_pt_path, spk_id, max_mix, cfg)
                 abs_pt = Path(cfg.static_out_dir) / rel_pt
                 ensure_dir(abs_pt.parent)
                 torch.save(pack, abs_pt)
@@ -931,32 +1256,6 @@ NEG_TYPES = [
 ]
 NEG_WEIGHTS = [0.18, 0.14, 0.10, 0.08, 0.10, 0.08, 0.14, 0.06, 0.12]
 NEG_DURATIONS = [2.0, 3.0, 4.0, 5.0, 6.0]
-FRAME_SHIFT_MS = 10
-FRAME_LEN_MS = 25
-
-
-def waveform_to_fbank(wav: torch.Tensor, sr: int, n_mels: int) -> torch.Tensor:
-    if torchaudio is None:
-        raise ImportError("torchaudio is required for synthetic negative generation")
-
-    if wav.dim() == 2:
-        wav = wav.mean(dim=0)
-    wav = wav.unsqueeze(0)
-
-    mel = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
-        n_fft=int(sr * FRAME_LEN_MS / 1000),
-        hop_length=int(sr * FRAME_SHIFT_MS / 1000),
-        win_length=int(sr * FRAME_LEN_MS / 1000),
-        n_mels=n_mels,
-        power=2.0,
-        center=True,
-        normalized=False,
-    )(wav)
-
-    mel = torch.clamp(mel, min=1e-10).log()
-    mel = mel.squeeze(0).transpose(0, 1).contiguous()
-    return (mel - mel.mean()) / (mel.std() + 1e-5)
 
 
 def apply_fade(wav: torch.Tensor, sr: int, fade_ms: float = 20.0):
@@ -1073,17 +1372,16 @@ def synth_negative_waveform(kind: str, sec: float, sr: int):
 
 def build_negative_pack(fbank: torch.Tensor, max_mix: int):
     T = int(fbank.shape[0])
-    return {
-        "fbank": fbank.float(),
-        "target_matrix": torch.zeros(T, max_mix, dtype=torch.float32),
-        "target_activity": torch.zeros(T, dtype=torch.float32),
-        "spk_label": -1,
-        "target_count": 0,
-    }
+    return finalize_pack(
+        fbank=fbank.float(),
+        target_matrix=torch.zeros(T, max_mix, dtype=torch.float32),
+        spk_label=-1,
+    )
 
 
 def add_negative_samples(cfg: BuildCfg):
     set_seed(cfg.seed)
+    ensure_static_mix_compatibility(cfg)
 
     max_mix = infer_max_mix_from_manifest(cfg.static_out_dir, "train_manifest.jsonl")
 
@@ -1102,7 +1400,12 @@ def add_negative_samples(cfg: BuildCfg):
             kind = random.choices(NEG_TYPES, weights=NEG_WEIGHTS, k=1)[0]
 
             wav = synth_negative_waveform(kind, sec, cfg.target_sr)
-            fbank = waveform_to_fbank(wav, sr=cfg.target_sr, n_mels=cfg.n_mels)
+            fbank = wav_to_fbank(
+                wav,
+                n_mels=cfg.n_mels,
+                num_crops=1,
+                crop_sec=max(cfg.crop_sec, sec),
+            )[0]
             pack = build_negative_pack(fbank, max_mix=max_mix)
 
             fname = f"neg_{kind}_{i:06d}.pt"
@@ -1133,52 +1436,68 @@ def add_negative_samples(cfg: BuildCfg):
 # CLI
 # =========================================================
 def parse_args():
+    defaults = BuildCfg()
     parser = argparse.ArgumentParser(description="Unified preprocessing script for Speaker-Verification")
 
     parser.add_argument("--stage", type=str, default="all",
                         choices=["cn", "augment_cn", "mix", "add_single", "add_negative", "all"])
 
-    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--incremental", dest="incremental", action="store_true")
     parser.add_argument("--no-incremental", dest="incremental", action="store_false")
-    parser.set_defaults(incremental=True)
+    parser.set_defaults(incremental=defaults.incremental)
     parser.add_argument("--backup_manifest", dest="backup_manifest", action="store_true")
     parser.add_argument("--no-backup_manifest", dest="backup_manifest", action="store_false")
-    parser.set_defaults(backup_manifest=True)
-    parser.add_argument("--backup_dir_name", type=str, default="_backups")
+    parser.set_defaults(backup_manifest=defaults.backup_manifest)
+    parser.add_argument("--backup_dir_name", type=str, default=defaults.backup_dir_name)
 
-    parser.add_argument("--cn_root", type=str, default="../CN-Celeb_flac")
-    parser.add_argument("--cn_out_dir", type=str, default="../processed/cn_celeb2")
-    parser.add_argument("--static_out_dir", type=str, default="../processed/static_mix_cnceleb2")
+    parser.add_argument("--cn_root", type=str, default=defaults.cn_root)
+    parser.add_argument("--cn_out_dir", type=str, default=defaults.cn_out_dir)
+    parser.add_argument("--static_out_dir", type=str, default=defaults.static_out_dir)
 
-    parser.add_argument("--target_sr", type=int, default=16000)
-    parser.add_argument("--n_mels", type=int, default=80)
-    parser.add_argument("--min_sec", type=float, default=1.0)
-    parser.add_argument("--val_utt_ratio", type=float, default=0.1)
-    parser.add_argument("--min_utts_per_spk", type=int, default=2)
+    parser.add_argument("--target_sr", type=int, default=defaults.target_sr)
+    parser.add_argument("--n_mels", type=int, default=defaults.n_mels)
+    parser.add_argument("--min_sec", type=float, default=defaults.min_sec)
+    parser.add_argument("--min_speech_ratio_per_utt", type=float, default=defaults.min_speech_ratio_per_utt)
+    parser.add_argument("--val_utt_ratio", type=float, default=defaults.val_utt_ratio)
+    parser.add_argument("--min_utts_per_spk", type=int, default=defaults.min_utts_per_spk)
+    parser.add_argument("--vad_threshold_ratio", type=float, default=defaults.vad_threshold_ratio)
+    parser.add_argument("--vad_smooth_frames", type=int, default=defaults.vad_smooth_frames)
+    parser.add_argument("--vad_min_speech_frames", type=int, default=defaults.vad_min_speech_frames)
+    parser.add_argument("--vad_fill_gap_frames", type=int, default=defaults.vad_fill_gap_frames)
 
-    parser.add_argument("--num_train_mixes", type=int, default=100000)
-    parser.add_argument("--num_val_mixes", type=int, default=20000)
-    parser.add_argument("--min_mix", type=int, default=2)
-    parser.add_argument("--max_mix", type=int, default=4)
-    parser.add_argument("--crop_sec", type=float, default=4.0)
-    parser.add_argument("--spk_snr_min", type=float, default=-5.0)
-    parser.add_argument("--spk_snr_max", type=float, default=5.0)
-    parser.add_argument("--noise_fbank_pt_dir", type=str, default="")
-    parser.add_argument("--noise_prob", type=float, default=0.3)
-    parser.add_argument("--noise_snr_min", type=float, default=-10.0)
-    parser.add_argument("--noise_snr_max", type=float, default=0.0)
-    parser.add_argument("--allow_overlap", action="store_true")
-    parser.add_argument("--max_offset_ratio", type=float, default=0.35)
+    parser.add_argument("--num_train_mixes", type=int, default=defaults.num_train_mixes)
+    parser.add_argument("--num_val_mixes", type=int, default=defaults.num_val_mixes)
+    parser.add_argument("--min_mix", type=int, default=defaults.min_mix)
+    parser.add_argument("--max_mix", type=int, default=defaults.max_mix)
+    parser.add_argument("--crop_sec", type=float, default=defaults.crop_sec)
+    parser.add_argument("--spk_snr_min", type=float, default=defaults.spk_snr_min)
+    parser.add_argument("--spk_snr_max", type=float, default=defaults.spk_snr_max)
+    parser.add_argument("--noise_fbank_pt_dir", type=str, default=defaults.noise_fbank_pt_dir)
+    parser.add_argument("--noise_prob", type=float, default=defaults.noise_prob)
+    parser.add_argument("--noise_snr_min", type=float, default=defaults.noise_snr_min)
+    parser.add_argument("--noise_snr_max", type=float, default=defaults.noise_snr_max)
+    parser.add_argument("--allow_overlap", dest="allow_overlap", action="store_true")
+    parser.add_argument("--no-allow_overlap", dest="allow_overlap", action="store_false")
+    parser.set_defaults(allow_overlap=defaults.allow_overlap)
+    parser.add_argument("--max_offset_ratio", type=float, default=defaults.max_offset_ratio)
+    parser.add_argument("--mix_source_dur_min_ratio", type=float, default=defaults.mix_source_dur_min_ratio)
+    parser.add_argument("--mix_source_dur_max_ratio", type=float, default=defaults.mix_source_dur_max_ratio)
+    parser.add_argument("--mix_use_augmented_sources", dest="mix_use_augmented_sources", action="store_true")
+    parser.add_argument("--no-mix_use_augmented_sources", dest="mix_use_augmented_sources", action="store_false")
+    parser.set_defaults(mix_use_augmented_sources=defaults.mix_use_augmented_sources)
 
-    parser.add_argument("--add_single_train", type=int, default=3000)
-    parser.add_argument("--add_single_val", type=int, default=500)
-    parser.add_argument("--add_neg_train", type=int, default=4000)
-    parser.add_argument("--add_neg_val", type=int, default=500)
-    parser.add_argument("--num_aug_per_utt_train", type=int, default=4)
-    parser.add_argument("--num_aug_per_utt_val", type=int, default=1)
-    parser.add_argument("--aug_subdir", type=str, default="fbank_pt_aug")
-    parser.add_argument("--augmentation_version", type=str, default="v2")
+    parser.add_argument("--add_single_train", type=int, default=defaults.add_single_train)
+    parser.add_argument("--add_single_val", type=int, default=defaults.add_single_val)
+    parser.add_argument("--add_neg_train", type=int, default=defaults.add_neg_train)
+    parser.add_argument("--add_neg_val", type=int, default=defaults.add_neg_val)
+    parser.add_argument("--single_source_dur_min_ratio", type=float, default=defaults.single_source_dur_min_ratio)
+    parser.add_argument("--single_source_dur_max_ratio", type=float, default=defaults.single_source_dur_max_ratio)
+    parser.add_argument("--single_max_pad_ratio", type=float, default=defaults.single_max_pad_ratio)
+    parser.add_argument("--num_aug_per_utt_train", type=int, default=defaults.num_aug_per_utt_train)
+    parser.add_argument("--num_aug_per_utt_val", type=int, default=defaults.num_aug_per_utt_val)
+    parser.add_argument("--aug_subdir", type=str, default=defaults.aug_subdir)
+    parser.add_argument("--augmentation_version", type=str, default=defaults.augmentation_version)
 
     args = parser.parse_args()
     return BuildCfg(**vars(args))

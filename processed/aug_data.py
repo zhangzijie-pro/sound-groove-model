@@ -6,23 +6,24 @@ from build_processed_dataset import BuildCfg, build_augmented_cn
 
 
 def parse_args() -> BuildCfg:
+    defaults = BuildCfg()
     parser = argparse.ArgumentParser(
         description="Compatibility wrapper for CN-Celeb feature augmentation. "
         "The implementation now lives in processed/build_processed_dataset.py."
     )
-    parser.add_argument("--cn_out_dir", type=str, default="../processed/cn_celeb2")
-    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--cn_out_dir", type=str, default=defaults.cn_out_dir)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--incremental", dest="incremental", action="store_true")
     parser.add_argument("--no-incremental", dest="incremental", action="store_false")
-    parser.set_defaults(incremental=True)
+    parser.set_defaults(incremental=defaults.incremental)
     parser.add_argument("--backup_manifest", dest="backup_manifest", action="store_true")
     parser.add_argument("--no-backup_manifest", dest="backup_manifest", action="store_false")
-    parser.set_defaults(backup_manifest=True)
-    parser.add_argument("--backup_dir_name", type=str, default="_backups")
-    parser.add_argument("--num_aug_per_utt_train", type=int, default=4)
-    parser.add_argument("--num_aug_per_utt_val", type=int, default=1)
-    parser.add_argument("--aug_subdir", type=str, default="fbank_pt_aug")
-    parser.add_argument("--augmentation_version", type=str, default="v2")
+    parser.set_defaults(backup_manifest=defaults.backup_manifest)
+    parser.add_argument("--backup_dir_name", type=str, default=defaults.backup_dir_name)
+    parser.add_argument("--num_aug_per_utt_train", type=int, default=defaults.num_aug_per_utt_train)
+    parser.add_argument("--num_aug_per_utt_val", type=int, default=defaults.num_aug_per_utt_val)
+    parser.add_argument("--aug_subdir", type=str, default=defaults.aug_subdir)
+    parser.add_argument("--augmentation_version", type=str, default=defaults.augmentation_version)
     args = parser.parse_args()
 
     cfg = BuildCfg(

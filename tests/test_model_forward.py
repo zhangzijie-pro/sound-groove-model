@@ -15,12 +15,7 @@ def test_resowave_forward():
 
     x = torch.randn(2, 400, 80)
 
-    global_emb, frame_embeds, slot_logits, activity_logits, count_logits = model(
-        x, return_diarization=True
-    )
+    frame_embeds, diar_logits = model(x)
 
-    assert global_emb.shape == (2, 64)
     assert frame_embeds.shape == (2, 400, 64)
-    assert slot_logits.shape == (2, 400, 5)      # silence + 4 speaker slots
-    assert activity_logits.shape == (2, 400)
-    assert count_logits.shape == (2, 5)          # 0..4 speakers
+    assert diar_logits.shape == (2, 400, 4)

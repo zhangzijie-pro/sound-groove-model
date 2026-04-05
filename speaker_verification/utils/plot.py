@@ -28,10 +28,8 @@ def plot_curves(out_dir: str, history: dict):
         plt.close(fig)
 
     train_loss_keys = [
-        ("train_pit_loss", "train_pit"),
-        ("train_act_loss", "train_act"),
-        ("train_cnt_loss", "train_cnt"),
-        ("train_frm_loss", "train_frm"),
+        ("train_diar_loss", "train_diar"),
+        ("train_smooth_loss", "train_smooth"),
     ]
     if any(_has_nonempty(history, k) for k, _ in train_loss_keys):
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -47,10 +45,8 @@ def plot_curves(out_dir: str, history: dict):
         plt.close(fig)
 
     val_loss_keys = [
-        ("val_pit_loss", "val_pit"),
-        ("val_act_loss", "val_act"),
-        ("val_cnt_loss", "val_cnt"),
-        ("val_frm_loss", "val_frm"),
+        ("val_diar_loss", "val_diar"),
+        ("val_smooth_loss", "val_smooth"),
     ]
     if any(_has_nonempty(history, k) for k, _ in val_loss_keys):
         fig, ax = plt.subplots(figsize=(8, 5))
@@ -68,6 +64,8 @@ def plot_curves(out_dir: str, history: dict):
     metric_keys = [
         ("val_der", "val_der(%)"),
         ("val_count_acc", "val_count_acc"),
+        ("val_act_prec", "val_act_prec"),
+        ("val_act_rec", "val_act_rec"),
         ("val_act_f1", "val_act_f1"),
     ]
     if any(_has_nonempty(history, k) for k, _ in metric_keys):

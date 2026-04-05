@@ -53,21 +53,21 @@ class DERTracker:
 
 
 @torch.no_grad()
-def hungarian_match_logits(slot_logits, target_matrix, valid_mask=None):
-    device = slot_logits.device
+def hungarian_match_logits(diar_logits, target_matrix, valid_mask=None):
+    device = diar_logits.device
     target_matrix = target_matrix.float().to(device)
 
-    B, T, K_logit = slot_logits.shape
+    B, T, K_logit = diar_logits.shape
     _, _, K_tgt = target_matrix.shape
 
     has_silence = (K_logit == K_tgt + 1)
 
     if has_silence:
-        silence_logits = slot_logits[..., :1]   # [B, T, 1]
-        speaker_logits = slot_logits[..., 1:]   # [B, T, K_logit-1]
+        silence_logits = diar_logits[..., :1]   # [B, T, 1]
+        speaker_logits = diar_logits[..., 1:]   # [B, T, K_logit-1]
     else:
         silence_logits = None
-        speaker_logits = slot_logits
+        speaker_logits = diar_logits
 
     K_spk_logit = speaker_logits.size(-1)
     K = min(K_spk_logit, K_tgt)
@@ -119,22 +119,22 @@ def hungarian_match_logits(slot_logits, target_matrix, valid_mask=None):
 
 @torch.no_grad()
 def diarization_error_rate_pit(
-    slot_logits,
+    diar_logits,
     target_matrix,
     target_activity=None,
     valid_mask=None,
     return_detail=False,
 ):
-    device = slot_logits.device
+    device = diar_logits.device
     target_matrix = target_matrix.float().to(device)
 
-    B, T, K_logit = slot_logits.shape
+    B, T, K_logit = diar_logits.shape
     _, _, K_tgt = target_matrix.shape
 
     has_silence = (K_logit == K_tgt + 1)
 
     pred_bin_full = hungarian_match_logits(
-        slot_logits,
+        diar_logits,
         target_matrix,
         valid_mask=valid_mask,
     )  # [B, T, K_logit]
