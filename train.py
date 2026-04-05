@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, Any, Optional
+from typing import Dict
 
 import hydra
 import torch
@@ -15,8 +15,6 @@ from speaker_verification.engine.checkpoint import (
 from speaker_verification.factory import build_model, build_loss, build_loaders
 from speaker_verification.logging_utils import setup_logger
 from speaker_verification.utils.seed import set_seed
-from speaker_verification.quantization.turboquant import build_turboquant
-
 
 try:
     from speaker_verification.utils.plot import plot_curves
@@ -35,7 +33,13 @@ def filter_state_dict(state_dict: Dict[str, torch.Tensor], exclude_prefixes=None
 
 
 def freeze_backbone_params(model, head_prefixes=None):
-    head_prefixes = head_prefixes or ["diar_head."]
+    """
+    Freeze everything except selected head prefixes.
+    For query-based diarization, typical trainable prefixes may include:
+      - decoder.
+      - assign_head.
+    """
+    head_prefixes = head_prefixes or ["decoder.", "assign_head."]
     for name, param in model.named_parameters():
         param.requires_grad = any(name.startswith(prefix) for prefix in head_prefixes)
 
@@ -52,6 +56,7 @@ def build_scheduler(cfg: DictConfig, optimizer: torch.optim.Optimizer):
 
     warmup_epochs = int(getattr(cfg.train, "warmup_epochs", 0))
     warmup_epochs = max(0, min(warmup_epochs, int(cfg.train.epochs) - 1))
+
     if warmup_epochs <= 0:
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -65,11 +70,13 @@ def build_scheduler(cfg: DictConfig, optimizer: torch.optim.Optimizer):
         end_factor=1.0,
         total_iters=warmup_epochs,
     )
+
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, int(cfg.train.epochs) - warmup_epochs),
         eta_min=float(cfg.train.min_lr),
     )
+
     return torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[warmup, cosine],
@@ -77,59 +84,83 @@ def build_scheduler(cfg: DictConfig, optimizer: torch.optim.Optimizer):
     )
 
 
-def build_history() -> Dict[str, list]:
+def build_history():
     return {
         "train_loss": [],
-        "train_diar_loss": [],
+        "train_pit_loss": [],
+        "train_exist_loss": [],
+        "train_pull_loss": [],
+        "train_sep_loss": [],
         "train_smooth_loss": [],
         "val_loss": [],
-        "val_diar_loss": [],
+        "val_pit_loss": [],
+        "val_exist_loss": [],
+        "val_pull_loss": [],
+        "val_sep_loss": [],
         "val_smooth_loss": [],
         "val_der": [],
         "val_count_acc": [],
+        "val_count_mae": [],
         "val_act_prec": [],
         "val_act_rec": [],
         "val_act_f1": [],
+        "val_exist_acc": [],
     }
 
 
-def append_history(history: Dict[str, list], train_stats: Dict[str, float], val_stats: Dict[str, float]):
+def append_history(history, train_stats, val_stats):
     history["train_loss"].append(train_stats["loss"])
-    history["train_diar_loss"].append(train_stats["diar_loss"])
+    history["train_pit_loss"].append(train_stats["pit_loss"])
+    history["train_exist_loss"].append(train_stats["exist_loss"])
+    history["train_pull_loss"].append(train_stats["pull_loss"])
+    history["train_sep_loss"].append(train_stats["sep_loss"])
     history["train_smooth_loss"].append(train_stats["smooth_loss"])
 
     history["val_loss"].append(val_stats["val_loss"])
-    history["val_diar_loss"].append(val_stats["diar_loss"])
+    history["val_pit_loss"].append(val_stats["pit_loss"])
+    history["val_exist_loss"].append(val_stats["exist_loss"])
+    history["val_pull_loss"].append(val_stats["pull_loss"])
+    history["val_sep_loss"].append(val_stats["sep_loss"])
     history["val_smooth_loss"].append(val_stats["smooth_loss"])
     history["val_der"].append(val_stats["der"])
     history["val_count_acc"].append(val_stats["count_acc"])
+    history["val_count_mae"].append(val_stats.get("count_mae", 0.0))
     history["val_act_prec"].append(val_stats["act_prec"])
     history["val_act_rec"].append(val_stats["act_rec"])
     history["val_act_f1"].append(val_stats["act_f1"])
+    history["val_exist_acc"].append(val_stats["exist_acc"])
 
 
-def log_epoch_stats(logger, epoch: int, train_stats: Dict[str, float], val_stats: Dict[str, float], lr: float):
+def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
     logger.info(
         "[Epoch %d] LR=%.6e | "
-        "TrainLoss=%.4f | TrainDiar=%.4f | TrainSmooth=%.6f",
+        "TrainLoss=%.4f | PIT=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f",
         epoch,
         lr,
         train_stats["loss"],
-        train_stats["diar_loss"],
+        train_stats["pit_loss"],
+        train_stats["exist_loss"],
+        train_stats["pull_loss"],
+        train_stats["sep_loss"],
         train_stats["smooth_loss"],
     )
 
     logger.info(
         "[Epoch %d] "
-        "ValLoss=%.4f | Diar=%.4f | Smooth=%.6f | "
-        "DER=%.2f%% | CAcc=%.2f%% | ActF1=%.2f%%",
+        "ValLoss=%.4f | PIT=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f | "
+        "DER=%.2f%% | CAcc=%.2f%% | CMAE=%.4f | ActF1=%.2f%% | ExistAcc=%.2f%%",
         epoch,
         val_stats["val_loss"],
-        val_stats["diar_loss"],
+        val_stats["pit_loss"],
+        val_stats["exist_loss"],
+        val_stats["pull_loss"],
+        val_stats["sep_loss"],
         val_stats["smooth_loss"],
         val_stats["der"],
         val_stats["count_acc"] * 100.0,
+        val_stats.get("count_mae", 0.0),
         val_stats["act_f1"] * 100.0,
+        val_stats["exist_acc"] * 100.0,
     )
 
     logger.info(
@@ -142,13 +173,6 @@ def log_epoch_stats(logger, epoch: int, train_stats: Dict[str, float], val_stats
         val_stats["der_detail"]["pred_active"],
     )
 
-    if val_stats.get("proto_cos_q", None) is not None:
-        logger.info(
-            "[Epoch %d] QuantCheck | ProtoCosQ=%.4f | TrackerUpdatesQ=%d",
-            epoch,
-            val_stats["proto_cos_q"],
-            int(val_stats.get("tracker_updates_q", 0)),
-        )
 
 def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
     if cfg.run.mode != "finetune":
@@ -178,7 +202,10 @@ def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
 
     if cfg.finetune.freeze_backbone:
         freeze_backbone_params(model, head_prefixes=list(cfg.finetune.head_prefixes))
-        logger.info("Backbone frozen. Train only head prefixes: %s", list(cfg.finetune.head_prefixes))
+        logger.info(
+            "Backbone frozen. Train only head prefixes: %s",
+            list(cfg.finetune.head_prefixes),
+        )
     else:
         logger.info("Backbone not frozen.")
 
@@ -187,7 +214,8 @@ def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
 
 def maybe_resume_training(cfg, model, optimizer, scheduler, device, logger):
     if not cfg.resume.enabled:
-        return 1, (float("inf") if cfg.output.monitor_mode == "min" else float("-inf")), build_history()
+        default_best = float("inf") if cfg.output.monitor_mode == "min" else float("-inf")
+        return 1, default_best, build_history()
 
     ckpt_path = cfg.resume.checkpoint_path
     if not ckpt_path:
@@ -196,7 +224,6 @@ def maybe_resume_training(cfg, model, optimizer, scheduler, device, logger):
         raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
-
     model.load_state_dict(get_model_state_from_ckpt(ckpt), strict=True)
 
     if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
@@ -210,6 +237,7 @@ def maybe_resume_training(cfg, model, optimizer, scheduler, device, logger):
         "best_metric",
         float("inf") if cfg.output.monitor_mode == "min" else float("-inf"),
     )
+
     loaded_history = ckpt.get("history", {})
     history = build_history()
     for key, value in loaded_history.items():
@@ -239,28 +267,6 @@ def main(cfg: DictConfig):
     train_loader, val_loader = build_loaders(cfg, device)
     model = build_model(cfg, device)
     loss_fn = build_loss(cfg, device)
-    frame_quantizer = None
-    tracker_quantizer = None
-
-    if getattr(cfg, "quant", None) is not None and cfg.quant.enable:
-        frame_quantizer = build_turboquant(
-            mode=cfg.quant.mode,
-            dim=int(cfg.model.embedding_dim),
-            bits=int(cfg.quant.bits),
-            clip_sigma=float(cfg.quant.clip_sigma),
-            device=str(device),
-            seed=int(cfg.quant.seed),
-        )
-
-        if cfg.quant.apply_tracker_quant:
-            tracker_quantizer = build_turboquant(
-                mode=cfg.quant.mode,
-                dim=int(cfg.model.embedding_dim),
-                bits=int(cfg.quant.bits),
-                clip_sigma=float(cfg.quant.clip_sigma),
-                device=str(device),
-                seed=int(cfg.quant.seed) + 99,
-            )
 
     actual_lr = maybe_load_finetune_weights(cfg, model, device, logger)
 
@@ -304,17 +310,8 @@ def main(cfg: DictConfig):
             device=device,
             max_batches=cfg.validate.max_batches,
             activity_threshold=cfg.validate.activity_threshold,
-            slot_threshold=cfg.validate.slot_threshold,
+            exist_threshold=cfg.validate.exist_threshold,
             min_active_frames=cfg.validate.min_active_frames,
-            min_slot_run=cfg.validate.min_slot_run,
-            fill_gap_frames=cfg.validate.fill_gap_frames,
-            slot_presence_frames=cfg.validate.slot_presence_frames,
-            frame_quantizer=frame_quantizer if cfg.quant.apply_frame_quant_in_validate else None,
-            tracker_quantizer=tracker_quantizer if cfg.quant.apply_tracker_quant else None,
-            run_quant_tracker=bool(cfg.quant.run_tracker_in_validate),
-            tracker_match_threshold=cfg.validate.tracker_match_threshold,
-            tracker_momentum=cfg.validate.tracker_momentum,
-            tracker_max_misses=cfg.validate.tracker_max_misses,
         )
 
         if scheduler is not None:

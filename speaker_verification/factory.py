@@ -1,20 +1,24 @@
 import torch
 from torch.utils.data import DataLoader
 
-from speaker_verification.models.resowave import ResoWave
+from speaker_verification.models.eend_query_model import EENDQueryModel
 from speaker_verification.loss.multi_task import MultiTaskLoss
 from speaker_verification.dataset.static_dataset import StaticMixDataset
 
 
 def build_model(cfg, device):
-    model = ResoWave(
+    model = EENDQueryModel(
         in_channels=cfg.model.in_channels,
-        channels=cfg.model.channels,
-        embedding_dim=cfg.model.embedding_dim,
-        max_mix_speakers=cfg.model.max_mix_speakers,
+        enc_channels=cfg.model.channels,
+        d_model=cfg.model.d_model,
+        max_speakers=cfg.model.max_mix_speakers,
+        decoder_type=cfg.model.decoder_type,
         post_ffn_hidden_dim=cfg.model.post_ffn_hidden_dim,
         post_ffn_dropout=cfg.model.post_ffn_dropout,
-        head_dropout=cfg.model.head_dropout,
+        decoder_layers=cfg.model.decoder_layers,
+        decoder_heads=cfg.model.decoder_heads,
+        decoder_ffn=cfg.model.decoder_ffn,
+        dropout=cfg.model.dropout,
     )
     return model.to(device)
 
@@ -22,6 +26,10 @@ def build_model(cfg, device):
 def build_loss(cfg, device):
     loss_fn = MultiTaskLoss(
         pit_pos_weight=cfg.loss.pit_pos_weight,
+        exist_pos_weight=getattr(cfg.loss, "exist_pos_weight", None),
+        lambda_exist=cfg.loss.lambda_exist,
+        lambda_pull=cfg.loss.lambda_pull,
+        lambda_sep=cfg.loss.lambda_sep,
         lambda_smooth=cfg.loss.lambda_smooth,
     )
     return loss_fn.to(device)
@@ -34,6 +42,7 @@ def build_loaders(cfg, device):
         crop_sec=cfg.data.crop_sec,
         shuffle=True,
     )
+
     val_set = StaticMixDataset(
         out_dir=cfg.data.out_dir,
         manifest=cfg.data.val_manifest,
@@ -49,6 +58,7 @@ def build_loaders(cfg, device):
         pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
+
     val_loader = DataLoader(
         val_set,
         batch_size=cfg.validate.batch_size,
@@ -57,4 +67,5 @@ def build_loaders(cfg, device):
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
+
     return train_loader, val_loader

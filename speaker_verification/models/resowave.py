@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from speaker_verification.models.wrr_mixer import HybridEPA_WRR_Block
-from speaker_verification.models.head.reat import REAT_DiarizationHead
 
 
 class Res2Conv1dReluBn(nn.Module):
@@ -82,74 +81,3 @@ class FeedForwardAdapter(nn.Module):
 
     def forward(self, x):
         return x + self.ffn(self.norm(x))
-
-
-class ResoWave(nn.Module):
-    def __init__(
-        self,
-        in_channels=80,
-        channels=512,
-        embedding_dim=192,
-        max_mix_speakers=5,
-        post_ffn_hidden_dim=None,
-        post_ffn_dropout=0.1,
-        head_dropout=0.1,
-        **kwargs,
-    ):
-        super().__init__()
-        legacy_embedding_dim = kwargs.pop("embd_dim", None)
-        alias_embedding_dim = kwargs.pop("emb_dim", None)
-        if kwargs:
-            unexpected = ", ".join(sorted(kwargs))
-            raise TypeError(f"Unexpected keyword arguments: {unexpected}")
-
-        if legacy_embedding_dim is not None and embedding_dim != 192:
-            raise TypeError("Use only one of `embedding_dim`, `emb_dim`, or `embd_dim`.")
-        if alias_embedding_dim is not None and embedding_dim != 192:
-            raise TypeError("Use only one of `embedding_dim`, `emb_dim`, or `embd_dim`.")
-
-        if legacy_embedding_dim is not None:
-            embedding_dim = legacy_embedding_dim
-        if alias_embedding_dim is not None:
-            embedding_dim = alias_embedding_dim
-
-        embedding_dim = int(embedding_dim)
-        post_ffn_hidden_dim = int(post_ffn_hidden_dim or channels * 2)
-        self.layer1 = Conv1dReluBn(in_channels, channels, kernel_size=5, padding=2)
-        self.layer2 = SE_Res2Block(channels, kernel_size=3, stride=1, padding=2, dilation=2, scale=8)
-        self.layer3 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
-        self.layer4 = HybridEPA_WRR_Block(channels, channels, wt_levels=3)
-        self.post_out4_ffn = FeedForwardAdapter(
-            dim=channels,
-            hidden_dim=post_ffn_hidden_dim,
-            dropout=post_ffn_dropout,
-        )
-
-        self.diar_head = REAT_DiarizationHead(
-            in_dim=channels,
-            emb_dim=embedding_dim,
-            num_speakers_max=max_mix_speakers,
-            dropout=head_dropout,
-        )
-
-    def forward(self, x):
-        """
-        Args:
-            x: [B, T, 80] log-fbank sequence.
-
-        Returns:
-            frame_embeds: [B, T, D] normalized frame-level speaker embeddings.
-            diar_logits: [B, T, K] frame-wise speaker activity logits.
-        """
-        x = x.transpose(1, 2)  # [B,80,T]
-
-        out1 = self.layer1(x)
-        out2 = self.layer2(out1)
-        out3 = self.layer3(out1 + out2)
-        out4 = self.layer4(out1 + out2 + out3)  # [B,512,T]
-
-        frame_feat = out4.transpose(1, 2).contiguous()  # [B,T,512]
-        frame_feat = self.post_out4_ffn(frame_feat)
-        frame_embeds, diar_logits = self.diar_head(frame_feat)
-
-        return frame_embeds, diar_logits

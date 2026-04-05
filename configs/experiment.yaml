@@ -1,72 +1,84 @@
 run:
-  mode: "train"   # train | finetune
+  mode: train   # train / finetune
+
+data:
+  out_dir: processed/static_mix_cnceleb2
+  train_manifest: train_manifest.jsonl
+  val_manifest: val_manifest.jsonl
+  crop_sec: 4.0
 
 model:
   in_channels: 80
   channels: 512
-  embedding_dim: 256
-  max_mix_speakers: 4
+  d_model: 256
+  max_mix_speakers: 6
+
+  # decoder type: query / eda_lstm
+  decoder_type: query
+
+  # query decoder
+  decoder_layers: 4
+  decoder_heads: 8
+  decoder_ffn: 1024
+
+  dropout: 0.1
   post_ffn_hidden_dim: 1024
   post_ffn_dropout: 0.1
-  head_dropout: 0.1
 
 loss:
-  pit_pos_weight: 2.25
-  lambda_smooth: 0.03
+  pit_pos_weight: 1.5
+  exist_pos_weight: 1.0
 
-data:
-  out_dir: "processed/static_mix_cnceleb2_v3"
-  train_manifest: "train_manifest.jsonl"
-  val_manifest: "val_manifest.jsonl"
-  crop_sec: 4.0
+  lambda_exist: 1.0
+  lambda_pull: 0.2
+  lambda_sep: 0.1
+  lambda_smooth: 0.01
 
 train:
   seed: 42
-  device: "cuda"
-  epochs: 140
-  batch_size: 12
+  device: cuda
+
+  batch_size: 8
   num_workers: 4
-  lr: 2.0e-4
-  min_lr: 5.0e-6
-  warmup_epochs: 5
-  warmup_start_factor: 0.2
-  weight_decay: 5.0e-5
-  grad_clip: 3.0
+
+  epochs: 80
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+
   use_scheduler: true
+  warmup_epochs: 5
+  warmup_start_factor: 0.1
 
 validate:
-  batch_size: 32
+  batch_size: 8
   max_batches: -1
-  activity_threshold: 0.42
-  slot_threshold: 0.45
-  min_active_frames: 4
-  min_slot_run: 3
-  fill_gap_frames: 6
-  slot_presence_frames: 8
-  tracker_match_threshold: 0.68
-  tracker_momentum: 0.92
-  tracker_max_misses: 40
+
+  activity_threshold: 0.5
+  exist_threshold: 0.5
+  min_active_frames: 3
 
 output:
-  save_dir: "outputs/default"
-  monitor: "der"           # choice: val_loss / der / act_f1
-  monitor_mode: "min"      # min | max
+  save_dir: outputs_e2e/
   plot_history: true
 
-finetune:
-  checkpoint_path: ""
-  load_mode: "full"        # full | backbone_only
-  strict_load: true
-  head_prefixes:
-    - "diar_head."
-  freeze_backbone: false
-  lr_scale: 0.1
+  # recommended: der / val_loss
+  monitor: der
+  monitor_mode: min
 
 resume:
   enabled: false
   checkpoint_path: ""
 
-hydra:
-  run:
-    dir: .
-  output_subdir: null
+finetune:
+  checkpoint_path: ""
+  load_mode: backbone_only   # backbone_only / full
+  strict_load: false
+  freeze_backbone: false
+  lr_scale: 0.5
+
+  # when freezing backbone, train only these prefixes
+  head_prefixes:
+    - decoder.
+    - assign_head.
