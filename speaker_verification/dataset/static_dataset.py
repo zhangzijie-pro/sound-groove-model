@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 class StaticMixDataset(Dataset):
     def __init__(
         self,
-        out_dir: str = "processed/static_mix_cnceleb2",
+        out_dir: str = "processed/real_diar_dataset",
         manifest: str = "train_manifest.jsonl",
         crop_sec: float = 4.0,
         shuffle: bool = True,
@@ -21,10 +21,11 @@ class StaticMixDataset(Dataset):
         assert self.manifest_path.is_file(), f"Missing manifest: {self.manifest_path}"
 
         spk2id_path = self.out_dir / "spk2id.json"
-        assert spk2id_path.is_file(), f"Missing spk2id.json: {spk2id_path}"
-
-        with spk2id_path.open("r", encoding="utf-8") as f:
-            self.spk2id = json.load(f)
+        if spk2id_path.is_file():
+            with spk2id_path.open("r", encoding="utf-8") as f:
+                self.spk2id = json.load(f)
+        else:
+            self.spk2id = {}
 
         self.num_classes = len(self.spk2id)
         self.items: List[str] = []

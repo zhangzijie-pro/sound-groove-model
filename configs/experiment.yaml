@@ -2,7 +2,7 @@ run:
   mode: train   # train / finetune
 
 data:
-  out_dir: processed/static_mix_cnceleb2
+  out_dir: processed/real_diar_dataset
   train_manifest: train_manifest.jsonl
   val_manifest: val_manifest.jsonl
   crop_sec: 4.0
@@ -11,7 +11,7 @@ model:
   in_channels: 80
   channels: 512
   d_model: 256
-  max_mix_speakers: 6
+  max_mix_speakers: 8
 
   # decoder type: query / eda_lstm
   decoder_type: query

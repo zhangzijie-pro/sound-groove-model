@@ -8,7 +8,7 @@ import torchaudio
 TARGET_SR = 16000
 
 
-def load_wav_mono(path: str, target_sr: int = TARGET_SR) -> torch.Tensor:
+def load_wav_mono(path: str, target_sr: int = TARGET_SR, trim_silence: bool = True) -> torch.Tensor:
     wav, sr = torchaudio.load(path)   # [C, T]
     wav = wav.mean(dim=0)             # [T]
     wav = wav.to(torch.float32)
@@ -16,12 +16,13 @@ def load_wav_mono(path: str, target_sr: int = TARGET_SR) -> torch.Tensor:
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
 
-    abs_w = wav.abs()
-    if abs_w.numel() > 0:
-        thr = max(1e-4, float(abs_w.max()) * 0.02)
-        idx = torch.nonzero(abs_w > thr, as_tuple=False).squeeze(-1)
-        if idx.numel() > 0:
-            wav = wav[idx[0].item(): idx[-1].item() + 1]
+    if trim_silence:
+        abs_w = wav.abs()
+        if abs_w.numel() > 0:
+            thr = max(1e-4, float(abs_w.max()) * 0.02)
+            idx = torch.nonzero(abs_w > thr, as_tuple=False).squeeze(-1)
+            if idx.numel() > 0:
+                wav = wav[idx[0].item(): idx[-1].item() + 1]
 
     return wav.contiguous()
 
