@@ -4,8 +4,7 @@ from tqdm import tqdm
 from speaker_verification.utils.meters import (
     AverageMeter,
     DERTracker,
-    diarization_error_rate_pit,
-    compute_activity_metrics,
+    diarization_error_rate_decoded,
     compute_count_acc_from_existence,
     compute_existence_acc,
     compute_count_mae_from_existence,
@@ -136,7 +135,10 @@ def validate(
         target_count = batch["target_count"].to(device, non_blocking=True)    # [B]
         valid_mask = batch["valid_mask"].to(device, non_blocking=True)        # [B,T]
 
-        frame_embeds, attractors, exist_logits, diar_logits = model(fbank)
+        frame_embeds, attractors, exist_logits, diar_logits = model(
+            fbank,
+            valid_mask=valid_mask,
+        )
 
         loss_dict = loss_fn(
             frame_embeds=frame_embeds,
@@ -159,10 +161,24 @@ def validate(
         smooth_meter.update(float(loss_dict["smooth_loss"].item()), bs)
 
         # ------------------------------------------------------------
-        # 1) training-time proxy DER (still PIT-based)
+        # 1) decoded DER aligned with inference-time gating
         # ------------------------------------------------------------
-        _, der_info = diarization_error_rate_pit(
-            diar_logits,
+        decoded_preds = []
+        for b in range(bs):
+            pred_bin_full, _, _, _, _ = _decode_predictions(
+                diar_logits=diar_logits[b],
+                exist_logits=exist_logits[b],
+                valid_mask=valid_mask[b],
+                activity_threshold=activity_threshold,
+                exist_threshold=exist_threshold,
+                min_active_frames=min_active_frames,
+            )
+            decoded_preds.append(pred_bin_full)
+
+        decoded_pred_batch = torch.stack(decoded_preds, dim=0)
+
+        _, der_info = diarization_error_rate_decoded(
+            decoded_pred_batch,
             target_matrix,
             valid_mask=valid_mask,
             return_detail=True,
@@ -200,35 +216,20 @@ def validate(
         # 3) activity metrics
         # use diar max as frame activity surrogate
         # ------------------------------------------------------------
-        target_activity = (target_matrix.sum(dim=-1) > 0).float()  # [B,T]
+        target_activity = (target_matrix.sum(dim=-1) > 0) & valid_mask.bool()   # [B,T]
+        pred_activity = (decoded_pred_batch.sum(dim=-1) > 0) & valid_mask.bool()
 
-        ap, ar, af1 = compute_activity_metrics(
-            pred_act_logits=diar_logits.max(dim=-1).values,
-            target_act=target_activity,
-            valid_mask=valid_mask,
-            threshold=activity_threshold,
-        )
+        tp = ((pred_activity == 1) & (target_activity == 1)).sum().item()
+        fp = ((pred_activity == 1) & (target_activity == 0)).sum().item()
+        fn = ((pred_activity == 0) & (target_activity == 1)).sum().item()
+
+        ap = tp / max(tp + fp, 1)
+        ar = tp / max(tp + fn, 1)
+        af1 = 2 * ap * ar / max(ap + ar, 1e-8)
         act_prec_sum += ap
         act_rec_sum += ar
         act_f1_sum += af1
         act_n += 1
-
-        # ------------------------------------------------------------
-        # 4) optional per-sample decode (debug / sanity path)
-        # not used for main metrics aggregation currently, but useful
-        # to ensure inference path is consistent with validate path
-        # ------------------------------------------------------------
-        # You can later expose this for richer validation outputs.
-        for b in range(bs):
-            vm = valid_mask[b].bool()
-            _ = _decode_predictions(
-                diar_logits=diar_logits[b][vm],
-                exist_logits=exist_logits[b],
-                valid_mask=torch.ones_like(valid_mask[b][vm], dtype=torch.bool),
-                activity_threshold=activity_threshold,
-                exist_threshold=exist_threshold,
-                min_active_frames=min_active_frames,
-            )
 
         pbar.set_postfix(
             total=f"{val_loss_meter.avg:.4f}",

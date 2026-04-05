@@ -27,7 +27,7 @@ class AttractorMetricLoss(nn.Module):
         self.pull_weight = pull_weight
         self.sep_margin = sep_margin
 
-    def forward(self, frame_embeds, attractors, aligned_targets, valid_mask=None):
+    def forward(self, frame_embeds, attractors, aligned_targets, exist_targets=None, valid_mask=None):
         """
         frame_embeds:   [B,T,D]
         attractors:     [B,N,D]
@@ -48,19 +48,29 @@ class AttractorMetricLoss(nn.Module):
         else:
             pull_loss = sim.new_tensor(0.0)
 
-        # separation among attractors
+        # separation only among active attractors selected by PIT
         B, N, _ = attractors.shape
-        aa = torch.matmul(attractors, attractors.transpose(1, 2))  # [B,N,N]
-        eye = torch.eye(N, device=aa.device, dtype=torch.bool).unsqueeze(0)
+        if exist_targets is None:
+            exist_targets = (aligned_targets.sum(dim=1) > 0).float()
 
-        sep_vals = aa.masked_fill(eye, -1.0)
-        sep_loss = torch.relu(sep_vals - self.sep_margin)
-        valid_sep = sep_loss > 0
+        sep_terms = []
+        for b in range(B):
+            active_idx = torch.where(exist_targets[b] > 0.5)[0]
+            if active_idx.numel() < 2:
+                continue
 
-        if valid_sep.any():
-            sep_loss = sep_loss[valid_sep].mean()
+            active_attr = attractors[b, active_idx]                     # [M, D]
+            aa = torch.matmul(active_attr, active_attr.transpose(0, 1)) # [M, M]
+            eye = torch.eye(aa.size(0), device=aa.device, dtype=torch.bool)
+            sep_vals = torch.relu(aa.masked_fill(eye, -1.0) - self.sep_margin)
+            valid_sep = sep_vals > 0
+            if valid_sep.any():
+                sep_terms.append(sep_vals[valid_sep].mean())
+
+        if sep_terms:
+            sep_loss = torch.stack(sep_terms).mean()
         else:
-            sep_loss = aa.new_tensor(0.0)
+            sep_loss = attractors.new_tensor(0.0)
 
         return pull_loss * self.pull_weight, sep_loss
 
@@ -125,6 +135,7 @@ class MultiTaskLoss(nn.Module):
             frame_embeds,
             attractors,
             aligned_targets,
+            exist_targets=exist_targets,
             valid_mask=valid_mask,
         )
 

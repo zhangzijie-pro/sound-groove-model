@@ -171,6 +171,89 @@ def diarization_error_rate_pit(
 
 
 @torch.no_grad()
+def diarization_error_rate_decoded(
+    pred_bin,
+    target_matrix,
+    valid_mask=None,
+    return_detail=False,
+):
+    """
+    Overlap-aware framewise DER after query gating / threshold decoding.
+
+    Args:
+        pred_bin:      [B, T, N_pred] binary predictions
+        target_matrix: [B, T, N_tgt] binary references
+        valid_mask:    [B, T]
+    """
+    device = pred_bin.device
+    pred_bin = pred_bin.float().to(device)
+    target_matrix = target_matrix.float().to(device)
+
+    B, T, _ = pred_bin.shape
+    if valid_mask is None:
+        valid_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+    else:
+        valid_mask = valid_mask.bool().to(device)
+
+    fa_total = pred_bin.new_tensor(0.0)
+    miss_total = pred_bin.new_tensor(0.0)
+    conf_total = pred_bin.new_tensor(0.0)
+    ref_total = pred_bin.new_tensor(0.0)
+    pred_total = pred_bin.new_tensor(0.0)
+
+    for b in range(B):
+        vm = valid_mask[b]
+        if not bool(vm.any().item()):
+            continue
+
+        pred_b = pred_bin[b][vm]            # [Tv, N_pred]
+        ref_b = target_matrix[b][vm]        # [Tv, N_tgt]
+
+        pred_active_idx = torch.where(pred_b.sum(dim=0) > 0)[0]
+        ref_active_idx = torch.where(ref_b.sum(dim=0) > 0)[0]
+
+        pred_act = pred_b[:, pred_active_idx] if pred_active_idx.numel() > 0 else pred_b.new_zeros(pred_b.size(0), 0)
+        ref_act = ref_b[:, ref_active_idx] if ref_active_idx.numel() > 0 else ref_b.new_zeros(ref_b.size(0), 0)
+
+        n_pred = pred_act.size(1)
+        n_ref = ref_act.size(1)
+
+        matched_correct = pred_b.new_zeros(pred_b.size(0))
+
+        if n_pred > 0 and n_ref > 0:
+            cost = torch.zeros(n_pred, n_ref, device=device)
+            for i in range(n_pred):
+                for j in range(n_ref):
+                    cost[i, j] = (pred_act[:, i] != ref_act[:, j]).float().mean()
+
+            row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+            for i, j in zip(row_ind, col_ind):
+                matched_correct += pred_act[:, i] * ref_act[:, j]
+
+        ref_count = ref_act.sum(dim=1)
+        pred_count = pred_act.sum(dim=1)
+        overlap = torch.minimum(ref_count, pred_count)
+
+        miss_total += torch.clamp(ref_count - pred_count, min=0.0).sum()
+        fa_total += torch.clamp(pred_count - ref_count, min=0.0).sum()
+        conf_total += torch.clamp(overlap - matched_correct, min=0.0).sum()
+        ref_total += ref_count.sum()
+        pred_total += pred_count.sum()
+
+    der = (fa_total + miss_total + conf_total) / ref_total.clamp_min(1.0)
+
+    if return_detail:
+        return der, {
+            "fa": float(fa_total.item()),
+            "miss": float(miss_total.item()),
+            "conf": float(conf_total.item()),
+            "gt_active": float(ref_total.item()),
+            "pred_active": float(pred_total.item()),
+        }
+    return der
+
+
+@torch.no_grad()
 def compute_activity_metrics(pred_act_logits, target_act, valid_mask, threshold=0.5):
     pred_act = (torch.sigmoid(pred_act_logits) >= threshold)
     pred_act = pred_act & valid_mask.bool()

@@ -52,7 +52,7 @@ class EENDQueryModel(nn.Module):
 
         self.assign_head = DotProductDiarizationHead(scale=d_model ** 0.5)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None):
         """
         x: [B,T,F]
         returns:
@@ -62,6 +62,14 @@ class EENDQueryModel(nn.Module):
             diar_logits: [B,T,N]
         """
         frame_embeds = self.encoder(x)
-        attractors, exist_logits = self.decoder(frame_embeds)
+        memory_key_padding_mask = None
+        if valid_mask is not None:
+            valid_mask = valid_mask.bool()
+            frame_embeds = frame_embeds * valid_mask.unsqueeze(-1).float()
+            memory_key_padding_mask = ~valid_mask
+        attractors, exist_logits = self.decoder(
+            frame_embeds,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )
         diar_logits = self.assign_head(frame_embeds, attractors)
         return frame_embeds, attractors, exist_logits, diar_logits

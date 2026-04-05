@@ -61,10 +61,22 @@ class PITDiarizationLoss(nn.Module):
         for b in range(B):
             tgt_present_idx = torch.where(target_presence[b])[0].tolist()
             num_present = len(tgt_present_idx)
+            pos_weight = torch.tensor(self.pos_weight, device=device)
 
             if num_present == 0:
-                # no active speaker
-                best_losses.append(diar_logits.new_tensor(0.0))
+                # no active speaker: all queries should stay silent
+                zero_targets = torch.zeros_like(diar_logits[b])
+                loss_raw = F.binary_cross_entropy_with_logits(
+                    diar_logits[b],
+                    zero_targets,
+                    reduction="none",
+                    pos_weight=pos_weight,
+                )
+                loss_raw = loss_raw[valid_mask[b]]
+                if loss_raw.numel() == 0:
+                    best_losses.append(diar_logits.new_tensor(0.0))
+                else:
+                    best_losses.append(loss_raw.mean())
                 matched_pred_indices_all.append([])
                 matched_tgt_indices_all.append([])
                 continue
@@ -80,23 +92,22 @@ class PITDiarizationLoss(nn.Module):
             best_pred_subset = None
             best_tgt_perm = None
 
-            pos_weight = torch.tensor(self.pos_weight, device=device)
-
             for pred_subset in itertools.combinations(pred_idx, num_present):
                 pred_subset = list(pred_subset)
 
-                logits_sel = diar_logits[b, :, pred_subset]          # [T, S]
                 targets_sel_all = targets[b, :, tgt_idx]            # [T, S]
 
                 for tgt_perm in itertools.permutations(range(num_present)):
-                    permuted_targets = targets_sel_all[:, list(tgt_perm)]  # [T, S]
+                    candidate_targets = torch.zeros_like(diar_logits[b])    # [T, N_pred]
+                    for pred_q, local_tgt_idx in zip(pred_subset, tgt_perm):
+                        candidate_targets[:, pred_q] = targets_sel_all[:, local_tgt_idx]
 
                     loss_raw = F.binary_cross_entropy_with_logits(
-                        logits_sel,
-                        permuted_targets,
+                        diar_logits[b],
+                        candidate_targets,
                         reduction="none",
                         pos_weight=pos_weight,
-                    )  # [T, S]
+                    )  # [T, N_pred]
 
                     loss_raw = loss_raw[valid_mask[b]]
                     if loss_raw.numel() == 0:

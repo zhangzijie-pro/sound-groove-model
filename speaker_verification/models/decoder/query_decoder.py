@@ -28,8 +28,14 @@ class QueryDecoder(nn.Module):
 
         self.out_norm = nn.LayerNorm(d_model)
         self.exist_head = nn.Linear(d_model, 1)
+        self.reset_parameters()
 
-    def forward(self, memory: torch.Tensor):
+    def reset_parameters(self):
+        nn.init.normal_(self.query_embed, mean=0.0, std=0.02)
+        nn.init.xavier_uniform_(self.exist_head.weight)
+        nn.init.constant_(self.exist_head.bias, -1.0)
+
+    def forward(self, memory: torch.Tensor, memory_key_padding_mask: torch.Tensor | None = None):
         """
         memory: [B, T, D]
         return:
@@ -42,6 +48,7 @@ class QueryDecoder(nn.Module):
         attractors = self.decoder(
             tgt=queries,
             memory=memory,
+            memory_key_padding_mask=memory_key_padding_mask,
         )  # [B,N,D]
 
         attractors = self.out_norm(attractors)

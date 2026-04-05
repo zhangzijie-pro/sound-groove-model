@@ -30,11 +30,20 @@ class LSTMAttractorDecoder(nn.Module):
         self.init_token = nn.Parameter(torch.randn(1, 1, d_model))
         self.attractor_proj = nn.Linear(hidden_size, d_model)
         self.exist_head = nn.Linear(d_model, 1)
+        self.reset_parameters()
 
-    def forward(self, memory: torch.Tensor):
+    def reset_parameters(self):
+        nn.init.normal_(self.init_token, mean=0.0, std=0.02)
+        nn.init.xavier_uniform_(self.attractor_proj.weight)
+        nn.init.zeros_(self.attractor_proj.bias)
+        nn.init.xavier_uniform_(self.exist_head.weight)
+        nn.init.constant_(self.exist_head.bias, -1.0)
+
+    def forward(self, memory: torch.Tensor, memory_key_padding_mask: torch.Tensor | None = None):
         """
         memory: [B,T,D]
         """
+        del memory_key_padding_mask
         B = memory.size(0)
 
         _, (h_n, c_n) = self.encoder(memory)

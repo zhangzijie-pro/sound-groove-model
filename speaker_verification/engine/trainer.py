@@ -24,7 +24,10 @@ def train_one_epoch(model, loss_fn, loader, optimizer, device, grad_clip=None):
 
         optimizer.zero_grad(set_to_none=True)
 
-        frame_embeds, attractors, exist_logits, diar_logits = model(fbank)
+        frame_embeds, attractors, exist_logits, diar_logits = model(
+            fbank,
+            valid_mask=valid_mask,
+        )
 
         loss_dict = loss_fn(
             frame_embeds=frame_embeds,
