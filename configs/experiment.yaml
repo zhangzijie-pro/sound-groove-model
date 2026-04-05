@@ -70,16 +70,3 @@ hydra:
   run:
     dir: .
   output_subdir: null
-
-quant:
-  enable: false
-  mode: "prod"          # mse | prod
-  bits: 3
-  clip_sigma: 3.0
-  seed: 1234
-
-  apply_frame_quant_in_validate: true
-
-  run_tracker_in_validate: true
-
-  apply_tracker_quant: true
