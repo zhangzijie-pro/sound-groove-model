@@ -267,8 +267,8 @@ class BuildCfg:
     real_hop_sec: float = 2.0
     real_max_mix: int = 8
     real_val_ratio: float = 0.10
-    real_min_active_sec: float = 0.10
-    real_keep_empty_prob_train: float = 0.10
+    real_min_active_sec: float = 0.05
+    real_keep_empty_prob_train: float = 0.30
     real_keep_empty_prob_val: float = 1.0
     skip_chunks_exceeding_max_mix: bool = True
 

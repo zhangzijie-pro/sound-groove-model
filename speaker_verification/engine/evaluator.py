@@ -39,8 +39,10 @@ def _remove_short_runs(binary_seq: torch.Tensor, min_active_frames: int = 3) -> 
 def _decode_predictions(
     diar_logits: torch.Tensor,
     exist_logits: torch.Tensor,
+    activity_logits: torch.Tensor,
     valid_mask: torch.Tensor,
-    activity_threshold: float = 0.5,
+    speaker_activity_threshold: float = 0.6,
+    frame_activity_threshold: float = 0.5,
     exist_threshold: float = 0.5,
     min_active_frames: int = 3,
 ):
@@ -50,41 +52,43 @@ def _decode_predictions(
     Args:
         diar_logits: [T, N]
         exist_logits: [N]
+        activity_logits: [T]
         valid_mask: [T]
 
     Returns:
         pred_bin_full: [T, N] binary speaker activity after existence gating
         pred_count: int
-        pred_activity_logits: [T]
+        pred_activity: [T]
         pred_exist: [N]
         keep_mask: [N]
     """
     diar_prob = torch.sigmoid(diar_logits)          # [T,N]
     exist_prob = torch.sigmoid(exist_logits)        # [N]
+    frame_activity_prob = torch.sigmoid(activity_logits)  # [T]
 
     keep_mask = exist_prob >= exist_threshold       # [N]
     pred_exist = keep_mask.float()
     pred_count = int(keep_mask.sum().item())
+    pred_activity = (frame_activity_prob >= frame_activity_threshold).float()
+    pred_activity = _remove_short_runs(pred_activity, min_active_frames=min_active_frames)
 
     pred_bin_full = torch.zeros_like(diar_prob, dtype=torch.float32)
 
     if pred_count > 0:
-        pred_bin_full[:, keep_mask] = (diar_prob[:, keep_mask] >= activity_threshold).float()
+        pred_bin_full[:, keep_mask] = (diar_prob[:, keep_mask] >= speaker_activity_threshold).float()
 
         # light smoothing on each active query stream
         for n in range(pred_bin_full.size(1)):
             if bool(keep_mask[n].item()):
                 pred_bin_full[:, n] = _remove_short_runs(
-                    pred_bin_full[:, n],
+                    pred_bin_full[:, n] * pred_activity,
                     min_active_frames=min_active_frames,
                 )
 
     pred_bin_full = pred_bin_full * valid_mask.unsqueeze(-1).float()
+    pred_activity = pred_activity * valid_mask.float()
 
-    # activity logits for VAD-like metric
-    pred_activity_logits = diar_logits.max(dim=-1).values  # [T]
-
-    return pred_bin_full, pred_count, pred_activity_logits, pred_exist, keep_mask
+    return pred_bin_full, pred_count, pred_activity, pred_exist, keep_mask
 
 
 @torch.no_grad()
@@ -94,7 +98,8 @@ def validate(
     loader,
     device,
     max_batches: int = -1,
-    activity_threshold: float = 0.5,
+    speaker_activity_threshold: float = 0.6,
+    frame_activity_threshold: float = 0.5,
     exist_threshold: float = 0.5,
     min_active_frames: int = 3,
 ):
@@ -102,6 +107,7 @@ def validate(
 
     val_loss_meter = AverageMeter()
     pit_meter = AverageMeter()
+    activity_meter = AverageMeter()
     exist_meter = AverageMeter()
     pull_meter = AverageMeter()
     sep_meter = AverageMeter()
@@ -135,7 +141,7 @@ def validate(
         target_count = batch["target_count"].to(device, non_blocking=True)    # [B]
         valid_mask = batch["valid_mask"].to(device, non_blocking=True)        # [B,T]
 
-        frame_embeds, attractors, exist_logits, diar_logits = model(
+        frame_embeds, attractors, exist_logits, diar_logits, activity_logits = model(
             fbank,
             valid_mask=valid_mask,
         )
@@ -145,6 +151,7 @@ def validate(
             attractors=attractors,
             exist_logits=exist_logits,
             diar_logits=diar_logits,
+            activity_logits=activity_logits,
             target_matrix=target_matrix,
             target_count=target_count,
             valid_mask=valid_mask,
@@ -155,6 +162,7 @@ def validate(
 
         val_loss_meter.update(float(loss_dict["total"].item()), bs)
         pit_meter.update(float(loss_dict["pit_loss"].item()), bs)
+        activity_meter.update(float(loss_dict["activity_loss"].item()), bs)
         exist_meter.update(float(loss_dict["exist_loss"].item()), bs)
         pull_meter.update(float(loss_dict["pull_loss"].item()), bs)
         sep_meter.update(float(loss_dict["sep_loss"].item()), bs)
@@ -164,18 +172,23 @@ def validate(
         # 1) decoded DER aligned with inference-time gating
         # ------------------------------------------------------------
         decoded_preds = []
+        decoded_activity = []
         for b in range(bs):
-            pred_bin_full, _, _, _, _ = _decode_predictions(
+            pred_bin_full, _, pred_activity, _, _ = _decode_predictions(
                 diar_logits=diar_logits[b],
                 exist_logits=exist_logits[b],
+                activity_logits=activity_logits[b],
                 valid_mask=valid_mask[b],
-                activity_threshold=activity_threshold,
+                speaker_activity_threshold=speaker_activity_threshold,
+                frame_activity_threshold=frame_activity_threshold,
                 exist_threshold=exist_threshold,
                 min_active_frames=min_active_frames,
             )
             decoded_preds.append(pred_bin_full)
+            decoded_activity.append(pred_activity)
 
         decoded_pred_batch = torch.stack(decoded_preds, dim=0)
+        decoded_activity_batch = torch.stack(decoded_activity, dim=0)
 
         _, der_info = diarization_error_rate_decoded(
             decoded_pred_batch,
@@ -214,10 +227,9 @@ def validate(
 
         # ------------------------------------------------------------
         # 3) activity metrics
-        # use diar max as frame activity surrogate
         # ------------------------------------------------------------
         target_activity = (target_matrix.sum(dim=-1) > 0) & valid_mask.bool()   # [B,T]
-        pred_activity = (decoded_pred_batch.sum(dim=-1) > 0) & valid_mask.bool()
+        pred_activity = decoded_activity_batch.bool() & valid_mask.bool()
 
         tp = ((pred_activity == 1) & (target_activity == 1)).sum().item()
         fp = ((pred_activity == 1) & (target_activity == 0)).sum().item()
@@ -234,6 +246,7 @@ def validate(
         pbar.set_postfix(
             total=f"{val_loss_meter.avg:.4f}",
             pit=f"{pit_meter.avg:.4f}",
+            act=f"{activity_meter.avg:.4f}",
             der=f"{der_tracker.value() * 100.0:.2f}%",
             cacc=f"{(count_acc_sum / max(count_acc_n, 1)) * 100.0:.2f}%",
             cmae=f"{(count_mae_sum / max(count_mae_n, 1)):.3f}",
@@ -246,6 +259,7 @@ def validate(
     out = {
         "val_loss": val_loss_meter.avg,
         "pit_loss": pit_meter.avg,
+        "activity_loss": activity_meter.avg,
         "exist_loss": exist_meter.avg,
         "pull_loss": pull_meter.avg,
         "sep_loss": sep_meter.avg,

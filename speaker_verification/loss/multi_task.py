@@ -21,6 +21,41 @@ class ExistenceLoss(nn.Module):
         return F.binary_cross_entropy_with_logits(exist_logits, exist_targets)
 
 
+class ActivityLoss(nn.Module):
+    def __init__(self, pos_weight=None):
+        super().__init__()
+        self.pos_weight = pos_weight
+
+    def forward(
+        self,
+        activity_logits: torch.Tensor,
+        activity_targets: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ):
+        if self.pos_weight is not None:
+            pos_weight = torch.tensor(self.pos_weight, device=activity_logits.device)
+            loss_raw = F.binary_cross_entropy_with_logits(
+                activity_logits,
+                activity_targets,
+                reduction="none",
+                pos_weight=pos_weight,
+            )
+        else:
+            loss_raw = F.binary_cross_entropy_with_logits(
+                activity_logits,
+                activity_targets,
+                reduction="none",
+            )
+
+        if valid_mask is not None:
+            valid_mask = valid_mask.bool().to(activity_logits.device)
+            loss_raw = loss_raw[valid_mask]
+
+        if loss_raw.numel() == 0:
+            return activity_logits.new_tensor(0.0)
+        return loss_raw.mean()
+
+
 class AttractorMetricLoss(nn.Module):
     def __init__(self, pull_weight=1.0, sep_margin=0.3):
         super().__init__()
@@ -80,6 +115,8 @@ class MultiTaskLoss(nn.Module):
         self,
         pit_pos_weight=1.5,
         exist_pos_weight=None,
+        activity_pos_weight=None,
+        lambda_activity=0.5,
         lambda_exist=1.0,
         lambda_pull=0.2,
         lambda_sep=0.1,
@@ -88,7 +125,9 @@ class MultiTaskLoss(nn.Module):
         super().__init__()
         self.diar_loss = PITDiarizationLoss(pos_weight=pit_pos_weight)
         self.exist_loss = ExistenceLoss(pos_weight=exist_pos_weight)
+        self.activity_loss = ActivityLoss(pos_weight=activity_pos_weight)
         self.metric_loss = AttractorMetricLoss()
+        self.lambda_activity = float(lambda_activity)
         self.lambda_exist = float(lambda_exist)
         self.lambda_pull = float(lambda_pull)
         self.lambda_sep = float(lambda_sep)
@@ -114,12 +153,15 @@ class MultiTaskLoss(nn.Module):
         attractors,
         exist_logits,
         diar_logits,
+        activity_logits,
         target_matrix,
         target_count,
         valid_mask=None,
         return_detail=False,
     ):
         del target_count  # now existence target comes from PIT matching, not naive count prefix
+
+        target_activity = (target_matrix.sum(dim=-1) > 0).float()
 
         pit_loss, aligned_targets, perm_info = self.diar_loss(
             diar_logits,
@@ -130,6 +172,11 @@ class MultiTaskLoss(nn.Module):
 
         exist_targets = perm_info["exist_targets"]  # [B,N_pred]
         exist_loss = self.exist_loss(exist_logits, exist_targets)
+        activity_loss = self.activity_loss(
+            activity_logits,
+            target_activity,
+            valid_mask=valid_mask,
+        )
 
         pull_loss, sep_loss = self.metric_loss(
             frame_embeds,
@@ -143,6 +190,7 @@ class MultiTaskLoss(nn.Module):
 
         total = (
             pit_loss
+            + self.lambda_activity * activity_loss
             + self.lambda_exist * exist_loss
             + self.lambda_pull * pull_loss
             + self.lambda_sep * sep_loss
@@ -153,12 +201,14 @@ class MultiTaskLoss(nn.Module):
             return {
                 "total": total,
                 "pit_loss": pit_loss.detach(),
+                "activity_loss": activity_loss.detach(),
                 "exist_loss": exist_loss.detach(),
                 "pull_loss": pull_loss.detach(),
                 "sep_loss": sep_loss.detach(),
                 "smooth_loss": smooth_loss.detach(),
                 "aligned_targets": aligned_targets.detach(),
                 "exist_targets": exist_targets.detach(),
+                "target_activity": target_activity.detach(),
             }
 
         return total

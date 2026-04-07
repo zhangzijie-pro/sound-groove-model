@@ -14,11 +14,15 @@ class StaticMixDataset(Dataset):
         manifest: str = "train_manifest.jsonl",
         crop_sec: float = 4.0,
         shuffle: bool = True,
+        crop_mode: str = "random",
     ):
         super().__init__()
         self.out_dir = Path(out_dir).expanduser().resolve()
         self.manifest_path = self.out_dir / manifest
         assert self.manifest_path.is_file(), f"Missing manifest: {self.manifest_path}"
+        self.crop_mode = str(crop_mode)
+        if self.crop_mode not in {"random", "center", "start"}:
+            raise ValueError(f"Unsupported crop_mode: {self.crop_mode}")
 
         spk2id_path = self.out_dir / "spk2id.json"
         if spk2id_path.is_file():
@@ -58,7 +62,12 @@ class StaticMixDataset(Dataset):
         T = fbank.size(0)
 
         if T > self.crop_frames:
-            s = random.randint(0, T - self.crop_frames)
+            if self.crop_mode == "random":
+                s = random.randint(0, T - self.crop_frames)
+            elif self.crop_mode == "center":
+                s = (T - self.crop_frames) // 2
+            else:
+                s = 0
             fbank = fbank[s:s + self.crop_frames]
             target_matrix = target_matrix[s:s + self.crop_frames]
             valid_mask = torch.ones(self.crop_frames, dtype=torch.bool)

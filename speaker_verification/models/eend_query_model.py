@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from speaker_verification.models.encoder.acoustic_encoder import AcousticEncoder
 from speaker_verification.models.decoder.query_decoder import QueryDecoder
@@ -51,6 +52,13 @@ class EENDQueryModel(nn.Module):
             raise ValueError(f"Unsupported decoder_type: {decoder_type}")
 
         self.assign_head = DotProductDiarizationHead(scale=d_model ** 0.5)
+        self.activity_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
 
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None):
         """
@@ -60,6 +68,7 @@ class EENDQueryModel(nn.Module):
             attractors: [B,N,D]
             exist_logits: [B,N]
             diar_logits: [B,T,N]
+            activity_logits: [B,T]
         """
         frame_embeds = self.encoder(x)
         memory_key_padding_mask = None
@@ -72,4 +81,10 @@ class EENDQueryModel(nn.Module):
             memory_key_padding_mask=memory_key_padding_mask,
         )
         diar_logits = self.assign_head(frame_embeds, attractors)
-        return frame_embeds, attractors, exist_logits, diar_logits
+        activity_logits = self.activity_head(frame_embeds).squeeze(-1)
+        if valid_mask is not None:
+            activity_logits = activity_logits.masked_fill(~valid_mask, -12.0)
+
+        # Keep frame embeddings normalized for metric learning and prototype matching.
+        frame_embeds = F.normalize(frame_embeds, dim=-1)
+        return frame_embeds, attractors, exist_logits, diar_logits, activity_logits

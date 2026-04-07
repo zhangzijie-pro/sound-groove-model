@@ -88,12 +88,14 @@ def build_history():
     return {
         "train_loss": [],
         "train_pit_loss": [],
+        "train_activity_loss": [],
         "train_exist_loss": [],
         "train_pull_loss": [],
         "train_sep_loss": [],
         "train_smooth_loss": [],
         "val_loss": [],
         "val_pit_loss": [],
+        "val_activity_loss": [],
         "val_exist_loss": [],
         "val_pull_loss": [],
         "val_sep_loss": [],
@@ -111,6 +113,7 @@ def build_history():
 def append_history(history, train_stats, val_stats):
     history["train_loss"].append(train_stats["loss"])
     history["train_pit_loss"].append(train_stats["pit_loss"])
+    history["train_activity_loss"].append(train_stats["activity_loss"])
     history["train_exist_loss"].append(train_stats["exist_loss"])
     history["train_pull_loss"].append(train_stats["pull_loss"])
     history["train_sep_loss"].append(train_stats["sep_loss"])
@@ -118,6 +121,7 @@ def append_history(history, train_stats, val_stats):
 
     history["val_loss"].append(val_stats["val_loss"])
     history["val_pit_loss"].append(val_stats["pit_loss"])
+    history["val_activity_loss"].append(val_stats["activity_loss"])
     history["val_exist_loss"].append(val_stats["exist_loss"])
     history["val_pull_loss"].append(val_stats["pull_loss"])
     history["val_sep_loss"].append(val_stats["sep_loss"])
@@ -134,11 +138,12 @@ def append_history(history, train_stats, val_stats):
 def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
     logger.info(
         "[Epoch %d] LR=%.6e | "
-        "TrainLoss=%.4f | PIT=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f",
+        "TrainLoss=%.4f | PIT=%.4f | Act=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f",
         epoch,
         lr,
         train_stats["loss"],
         train_stats["pit_loss"],
+        train_stats["activity_loss"],
         train_stats["exist_loss"],
         train_stats["pull_loss"],
         train_stats["sep_loss"],
@@ -147,11 +152,12 @@ def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
 
     logger.info(
         "[Epoch %d] "
-        "ValLoss=%.4f | PIT=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f | "
+        "ValLoss=%.4f | PIT=%.4f | Act=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f | "
         "DER=%.2f%% | CAcc=%.2f%% | CMAE=%.4f | ActF1=%.2f%% | ExistAcc=%.2f%%",
         epoch,
         val_stats["val_loss"],
         val_stats["pit_loss"],
+        val_stats["activity_loss"],
         val_stats["exist_loss"],
         val_stats["pull_loss"],
         val_stats["sep_loss"],
@@ -293,6 +299,7 @@ def main(cfg: DictConfig):
     for epoch in range(start_epoch, cfg.train.epochs + 1):
         logger.info("=" * 80)
         logger.info("Epoch %d/%d started", epoch, cfg.train.epochs)
+        current_lr = optimizer.param_groups[0]["lr"]
 
         train_stats = train_one_epoch(
             model=model,
@@ -309,7 +316,8 @@ def main(cfg: DictConfig):
             loader=val_loader,
             device=device,
             max_batches=cfg.validate.max_batches,
-            activity_threshold=cfg.validate.activity_threshold,
+            speaker_activity_threshold=getattr(cfg.validate, "speaker_activity_threshold", getattr(cfg.validate, "activity_threshold", 0.6)),
+            frame_activity_threshold=getattr(cfg.validate, "frame_activity_threshold", 0.5),
             exist_threshold=cfg.validate.exist_threshold,
             min_active_frames=cfg.validate.min_active_frames,
         )
@@ -318,8 +326,6 @@ def main(cfg: DictConfig):
             scheduler.step()
 
         append_history(history, train_stats, val_stats)
-
-        current_lr = optimizer.param_groups[0]["lr"]
         log_epoch_stats(logger, epoch, train_stats, val_stats, current_lr)
 
         save_checkpoint(

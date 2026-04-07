@@ -29,12 +29,17 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--chunk_sec", type=float, default=4.0)
     parser.add_argument("--hop_sec", type=float, default=2.0)
-    parser.add_argument("--activity_threshold", type=float, default=0.5)
+    parser.add_argument("--speaker_activity_threshold", type=float, default=0.60)
+    parser.add_argument("--frame_activity_threshold", type=float, default=0.50)
+    parser.add_argument("--activity_threshold", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--exist_threshold", type=float, default=0.5)
-    parser.add_argument("--min_active_frames", type=int, default=3)
+    parser.add_argument("--min_active_frames", type=int, default=5)
     parser.add_argument("--prototype_match_threshold", type=float, default=0.70)
     parser.add_argument("--prototype_momentum", type=float, default=0.8)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.activity_threshold is not None:
+        args.speaker_activity_threshold = args.activity_threshold
+    return args
 
 
 def load_jsonl(path: str | Path) -> List[dict]:
@@ -135,17 +140,22 @@ def remove_short_runs(binary_seq: torch.Tensor, min_active_frames: int) -> torch
 def decode_chunk(
     diar_logits: torch.Tensor,
     exist_logits: torch.Tensor,
+    activity_logits: torch.Tensor,
     min_active_frames: int,
-    activity_threshold: float,
+    speaker_activity_threshold: float,
+    frame_activity_threshold: float,
     exist_threshold: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     diar_prob = torch.sigmoid(diar_logits)
     exist_prob = torch.sigmoid(exist_logits)
+    frame_activity_prob = torch.sigmoid(activity_logits)
     keep_mask = exist_prob >= exist_threshold
+    frame_active = (frame_activity_prob >= frame_activity_threshold).float()
+    frame_active = remove_short_runs(frame_active, min_active_frames=min_active_frames)
     pred_bin = torch.zeros_like(diar_prob, dtype=torch.float32)
 
     for idx in torch.where(keep_mask)[0].tolist():
-        pred_bin[:, idx] = (diar_prob[:, idx] >= activity_threshold).float()
+        pred_bin[:, idx] = (diar_prob[:, idx] >= speaker_activity_threshold).float() * frame_active
         pred_bin[:, idx] = remove_short_runs(pred_bin[:, idx], min_active_frames=min_active_frames)
 
     return pred_bin, keep_mask
@@ -324,7 +334,8 @@ def infer_recording(
     device: torch.device,
     chunk_sec: float,
     hop_sec: float,
-    activity_threshold: float,
+    speaker_activity_threshold: float,
+    frame_activity_threshold: float,
     exist_threshold: float,
     min_active_frames: int,
     prototype_match_threshold: float,
@@ -348,18 +359,21 @@ def infer_recording(
 
         chunk_feat = chunk_feat.unsqueeze(0).to(device)
         valid_mask = valid_mask.unsqueeze(0).to(device)
-        _, attractors, exist_logits, diar_logits = model(chunk_feat, valid_mask=valid_mask)
+        _, attractors, exist_logits, diar_logits, activity_logits = model(chunk_feat, valid_mask=valid_mask)
 
         attractors = attractors[0].cpu()
         exist_logits = exist_logits[0].cpu()
         diar_logits = diar_logits[0].cpu()
+        activity_logits = activity_logits[0].cpu()
         valid_len = int(valid_mask[0].sum().item())
 
         pred_bin, keep_mask = decode_chunk(
             diar_logits[:valid_len],
             exist_logits,
+            activity_logits[:valid_len],
             min_active_frames=min_active_frames,
-            activity_threshold=activity_threshold,
+            speaker_activity_threshold=speaker_activity_threshold,
+            frame_activity_threshold=frame_activity_threshold,
             exist_threshold=exist_threshold,
         )
 
@@ -406,7 +420,8 @@ def main():
             device=device,
             chunk_sec=args.chunk_sec,
             hop_sec=args.hop_sec,
-            activity_threshold=args.activity_threshold,
+            speaker_activity_threshold=args.speaker_activity_threshold,
+            frame_activity_threshold=args.frame_activity_threshold,
             exist_threshold=args.exist_threshold,
             min_active_frames=args.min_active_frames,
             prototype_match_threshold=args.prototype_match_threshold,

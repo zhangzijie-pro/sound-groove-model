@@ -27,6 +27,8 @@ def build_loss(cfg, device):
     loss_fn = MultiTaskLoss(
         pit_pos_weight=cfg.loss.pit_pos_weight,
         exist_pos_weight=getattr(cfg.loss, "exist_pos_weight", None),
+        activity_pos_weight=getattr(cfg.loss, "activity_pos_weight", None),
+        lambda_activity=getattr(cfg.loss, "lambda_activity", 0.5),
         lambda_exist=cfg.loss.lambda_exist,
         lambda_pull=cfg.loss.lambda_pull,
         lambda_sep=cfg.loss.lambda_sep,
@@ -41,6 +43,7 @@ def build_loaders(cfg, device):
         manifest=cfg.data.train_manifest,
         crop_sec=cfg.data.crop_sec,
         shuffle=True,
+        crop_mode="random",
     )
 
     val_set = StaticMixDataset(
@@ -48,6 +51,7 @@ def build_loaders(cfg, device):
         manifest=cfg.data.val_manifest,
         crop_sec=cfg.data.crop_sec,
         shuffle=False,
+        crop_mode="center",
     )
 
     train_loader = DataLoader(
