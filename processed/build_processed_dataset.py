@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import random
@@ -19,13 +20,11 @@ from speaker_verification.audio.features import load_wav_mono, wav_to_fbank_infe
 PROCESSED_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PROCESSED_ROOT.parent
 DATASETS_ROOT = (PROCESSED_ROOT / ".." / ".." / "datasets").resolve()
-AISHELL4_ROOT = DATASETS_ROOT / "AISHELL-4-near"
+AISHELL4_ROOT = DATASETS_ROOT
 VOXCONVERSE_ROOT = DATASETS_ROOT / "voxconverse"
 OUTPUT_ROOT = PROJECT_ROOT / "processed" / "real_diar_dataset"
 
 AISHELL4_TRAIN_SOURCE_SPLITS = ["Train_Ali_near"]
-VOXCONVERSE_TRAIN_SOURCE_SPLITS = ["dev"]
-VOXCONVERSE_TEST_SOURCE_SPLITS = ["test"]
 
 
 def set_seed(seed: int):
@@ -122,6 +121,67 @@ def parse_rttm(path: str | Path) -> List[Dict[str, Any]]:
     return segments
 
 
+def parse_textgrid(path: str | Path) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    path = Path(path)
+    recording_id = path.stem
+    speaker_name = recording_id.split("_")[-1]
+
+    intervals: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {}
+    in_interval = False
+
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+
+            if line.startswith("intervals ["):
+                if in_interval:
+                    intervals.append(current)
+                current = {}
+                in_interval = True
+                continue
+
+            if not in_interval:
+                continue
+
+            if line.startswith("xmin ="):
+                try:
+                    current["start"] = float(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("xmax ="):
+                try:
+                    current["end"] = float(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("text ="):
+                text = line.split("=", 1)[1].strip()
+                if text.startswith('"') and text.endswith('"'):
+                    text = text[1:-1]
+                current["text"] = text
+
+        if in_interval:
+            intervals.append(current)
+
+    for item in intervals:
+        start = float(item.get("start", 0.0))
+        end = float(item.get("end", 0.0))
+        text = str(item.get("text", "")).strip()
+        if end <= start or not text:
+            continue
+        segments.append(
+            {
+                "recording_id": recording_id,
+                "start": start,
+                "end": end,
+                "speaker": speaker_name,
+            }
+        )
+
+    return segments
+
+
 def build_audio_stem_map(root: Path) -> Dict[str, Path]:
     audio_map: Dict[str, Path] = {}
     if not root.is_dir():
@@ -164,6 +224,37 @@ def collect_split_records(dataset: str, root: Path, split_names: List[str]) -> L
                     "rttm_path": normalize_path(rttm_path),
                 }
             )
+
+    return records
+
+
+def collect_aishell4_records(root: Path, split_names: List[str]) -> List[Dict[str, str]]:
+    records: List[Dict[str, str]] = []
+
+    for split in split_names:
+        split_dir = root / split
+        layout_root = split_dir if split_dir.is_dir() else root
+        audio_map = build_audio_stem_map(layout_root / "audio_dir")
+        textgrid_map = {path.stem: path for path in (layout_root / "textgrid_dir").glob("*.TextGrid")}
+
+        if not audio_map or not textgrid_map:
+            if split_dir.is_dir():
+                records.extend(collect_split_records("aishell4", root, [split]))
+                continue
+            print(f"[WARN] Missing AISHELL4 split dir: {split_dir}. Fallback to flat layout under {root}")
+
+        for stem in sorted(set(audio_map.keys()) & set(textgrid_map.keys())):
+            records.append(
+                {
+                    "dataset": "aishell4",
+                    "split": split,
+                    "recording_id": stem,
+                    "wav_path": normalize_path(audio_map[stem]),
+                    "rttm_path": normalize_path(textgrid_map[stem]),
+                    "annotation_type": "textgrid",
+                }
+            )
+        break
 
     return records
 
@@ -233,8 +324,9 @@ def build_chunk_target_from_rttm(
 
 
 def finalize_pack(fbank: torch.Tensor, target_matrix: torch.Tensor, **extra: Any) -> Dict[str, Any]:
-    fbank = fbank.float().cpu()
-    target_matrix = target_matrix.float().cpu()
+    # Clone to break any view/storage sharing before serialization.
+    fbank = fbank.detach().clone().contiguous().float().cpu()
+    target_matrix = target_matrix.detach().clone().contiguous().float().cpu()
     target_activity = (target_matrix.sum(dim=-1) > 0).float()
     target_count = int((target_matrix.sum(dim=0) > 0).sum().item())
     pack = {
@@ -246,6 +338,16 @@ def finalize_pack(fbank: torch.Tensor, target_matrix: torch.Tensor, **extra: Any
     }
     pack.update(extra)
     return pack
+
+
+def atomic_torch_save(obj: Any, path: str | Path):
+    path = Path(path)
+    ensure_dir(path.parent)
+    buffer = io.BytesIO()
+    torch.save(obj, buffer)
+    with path.open("wb") as f:
+        f.write(buffer.getbuffer())
+        f.flush()
 
 
 @dataclass
@@ -276,13 +378,9 @@ class BuildCfg:
 def save_meta(cfg: BuildCfg, output_root: Path):
     meta = {
         "schema_version": "real_diar_v1",
-        "sources": ["aishell4_near", "voxconverse"],
+        "sources": ["aishell4_near"],
         "train_source_splits": {
             "aishell4": AISHELL4_TRAIN_SOURCE_SPLITS,
-            "voxconverse": VOXCONVERSE_TRAIN_SOURCE_SPLITS,
-        },
-        "test_source_splits": {
-            "voxconverse": VOXCONVERSE_TEST_SOURCE_SPLITS,
         },
         "target_sr": cfg.target_sr,
         "n_mels": cfg.n_mels,
@@ -366,7 +464,11 @@ def build_real_diar_split(
             crop_sec=None,
             crop_mode="none",
         ).float().cpu()
-        segments = parse_rttm(record["rttm_path"])
+        annotation_type = str(record.get("annotation_type", "rttm")).lower()
+        if annotation_type == "textgrid":
+            segments = parse_textgrid(record["rttm_path"])
+        else:
+            segments = parse_rttm(record["rttm_path"])
         starts = sliding_window_starts(feat.size(0), chunk_frames=chunk_frames, hop_frames=hop_frames)
 
         for chunk_idx, start_frame in enumerate(starts):
@@ -417,6 +519,7 @@ def build_real_diar_split(
                 recording_id=record["recording_id"],
                 wav_path=record["wav_path"],
                 rttm_path=record["rttm_path"],
+                annotation_type=annotation_type,
                 chunk_index=int(chunk_idx),
                 chunk_start_sec=float(chunk_start_sec),
                 chunk_end_sec=float(chunk_end_sec),
@@ -425,7 +528,7 @@ def build_real_diar_split(
             )
 
             ensure_dir(abs_pt.parent)
-            torch.save(pack, abs_pt)
+            atomic_torch_save(pack, abs_pt)
 
             item = {
                 "pt": rel_pt,
@@ -434,6 +537,7 @@ def build_real_diar_split(
                 "recording_id": record["recording_id"],
                 "wav_path": record["wav_path"],
                 "rttm_path": record["rttm_path"],
+                "annotation_type": annotation_type,
                 "chunk_start_sec": float(chunk_start_sec),
                 "chunk_end_sec": float(chunk_end_sec),
                 "target_count": int(pack["target_count"]),
@@ -460,27 +564,20 @@ def build_real_diar_dataset(cfg: BuildCfg):
     ensure_dir(output_root)
     save_meta(cfg, output_root)
 
-    aishell_all = collect_split_records("aishell4", Path(cfg.aishell4_root), AISHELL4_TRAIN_SOURCE_SPLITS)
-    vox_all = collect_split_records("voxconverse", Path(cfg.voxconverse_root), VOXCONVERSE_TRAIN_SOURCE_SPLITS)
+    aishell_all = collect_aishell4_records(Path(cfg.aishell4_root), AISHELL4_TRAIN_SOURCE_SPLITS)
 
     aishell_train, aishell_val = split_train_val_records(
         aishell_all,
         val_ratio=cfg.real_val_ratio,
         seed=cfg.seed,
     )
-    vox_train, vox_val = split_train_val_records(
-        vox_all,
-        val_ratio=cfg.real_val_ratio,
-        seed=cfg.seed,
-    )
 
-    train_records = aishell_train + vox_train
-    val_records = aishell_val + vox_val
-    test_records = collect_split_records("voxconverse", Path(cfg.voxconverse_root), VOXCONVERSE_TEST_SOURCE_SPLITS)
+    train_records = aishell_train
+    val_records = aishell_val
 
     if not train_records:
         raise FileNotFoundError(
-            "No training records found. Check aishell4_root / voxconverse_root and split directory layout."
+            "No AISHELL4 training records found. Check aishell4_root and Train_Ali_near layout."
         )
 
     build_real_diar_split(
@@ -501,17 +598,6 @@ def build_real_diar_dataset(cfg: BuildCfg):
         )
     else:
         print("[REAL DIAR] No validation records found. Only train_manifest was generated.")
-
-    if test_records:
-        build_real_diar_split(
-            split_name="test",
-            records=test_records,
-            cfg=cfg,
-            output_root=output_root,
-            keep_empty_prob=1.0,
-        )
-    else:
-        print("[REAL DIAR] No test records found. test_manifest was not generated.")
 
 
 def main():
