@@ -207,8 +207,7 @@ marimo/_lsp/
 __marimo__/
 *.wav
 CN-Celeb_flac/
-processed/cn_celeb2/
-processed/static_mix_cnceleb2/
+processed/real_diar_dataset/
 
 outputs/
 eval_staticmix/
