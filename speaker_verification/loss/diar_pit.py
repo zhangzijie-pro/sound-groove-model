@@ -1,146 +1,148 @@
-import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 
 
 class PITDiarizationLoss(nn.Module):
     """
-    PIT diarization loss for query/attractor-based diarization.
+    Hungarian-aligned diarization BCE.
 
-    Returns:
-        - loss
-        - aligned_targets: target aligned to predicted speaker-query order
-        - best_perm_info:
-            {
-                "matched_pred_indices": List[List[int]],
-                "matched_tgt_indices": List[List[int]],
-                "exist_targets": Tensor[B, N_pred],
-            }
+    This keeps the training objective permutation-invariant without using
+    factorial enumeration over all speaker-query assignments.
     """
 
-    def __init__(self, pos_weight=1.5):
+    def __init__(self, pos_weight: float = 1.0):
         super().__init__()
         self.pos_weight = float(pos_weight)
 
-    def forward(self, diar_logits, targets, valid_mask=None, return_perm=False):
+    def _pairwise_bce_cost(
+        self,
+        diar_logits: torch.Tensor,
+        target_matrix: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            diar_logits: [T, N_pred]
+            target_matrix: [T, N_tgt]
+            valid_mask: [T]
+
+        Returns:
+            cost: [N_pred, N_tgt]
+        """
+        if target_matrix.size(1) == 0:
+            return diar_logits.new_zeros(diar_logits.size(1), 0)
+
+        pred = diar_logits.unsqueeze(-1)           # [T, N_pred, 1]
+        tgt = target_matrix.unsqueeze(-2)          # [T, 1, N_tgt]
+        pred = pred.expand(-1, -1, target_matrix.size(1))
+        tgt = tgt.expand(-1, diar_logits.size(1), -1)
+
+        pos_weight = torch.tensor(self.pos_weight, device=diar_logits.device)
+        bce = F.binary_cross_entropy_with_logits(
+            pred,
+            tgt,
+            reduction="none",
+            pos_weight=pos_weight,
+        )
+
+        mask = valid_mask.unsqueeze(-1).unsqueeze(-1).float()
+        denom = valid_mask.sum().clamp(min=1).float()
+        return (bce * mask).sum(dim=0) / denom
+
+    def forward(
+        self,
+        diar_logits: torch.Tensor,
+        target_matrix: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        return_perm: bool = False,
+    ):
         """
         Args:
             diar_logits: [B, T, N_pred]
-            targets:     [B, T, N_tgt]
-            valid_mask:  [B, T]
+            target_matrix: [B, T, N_tgt]
+            valid_mask: [B, T]
 
         Returns:
-            if return_perm=False:
-                loss
-            else:
-                loss, aligned_targets, perm_info
+            loss
+            aligned_targets: [B, T, N_pred]
+            perm_info: {"exist_targets": [B, N_pred], "assignments": list}
         """
         device = diar_logits.device
-        targets = targets.float().to(device)
+        target_matrix = target_matrix.float().to(device)
 
-        B, T, N_pred = diar_logits.shape
-        _, _, N_tgt = targets.shape
-
+        batch_size, time_steps, num_pred = diar_logits.shape
         if valid_mask is None:
-            valid_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+            valid_mask = torch.ones(batch_size, time_steps, dtype=torch.bool, device=device)
         else:
             valid_mask = valid_mask.bool().to(device)
 
-        aligned_targets = torch.zeros_like(diar_logits)
-        exist_targets = torch.zeros(B, N_pred, dtype=torch.float32, device=device)
+        aligned_targets = torch.zeros(
+            batch_size,
+            time_steps,
+            num_pred,
+            dtype=target_matrix.dtype,
+            device=device,
+        )
+        exist_targets = torch.zeros(
+            batch_size,
+            num_pred,
+            dtype=target_matrix.dtype,
+            device=device,
+        )
+        assignments: list[list[tuple[int, int]]] = []
+        sample_losses = []
 
-        best_losses = []
-        matched_pred_indices_all = []
-        matched_tgt_indices_all = []
+        pos_weight = torch.tensor(self.pos_weight, device=device)
 
-        # speaker presence in reference target
-        # which target speakers actually appear in this chunk?
-        target_presence = (targets.sum(dim=1) > 0)  # [B, N_tgt]
+        for batch_idx in range(batch_size):
+            vm = valid_mask[batch_idx]
+            logits_b = diar_logits[batch_idx]      # [T, N_pred]
+            target_b = target_matrix[batch_idx]    # [T, N_tgt]
 
-        for b in range(B):
-            tgt_present_idx = torch.where(target_presence[b])[0].tolist()
-            num_present = len(tgt_present_idx)
-            pos_weight = torch.tensor(self.pos_weight, device=device)
-
-            if num_present == 0:
-                # no active speaker: all queries should stay silent
-                zero_targets = torch.zeros_like(diar_logits[b])
-                loss_raw = F.binary_cross_entropy_with_logits(
-                    diar_logits[b],
-                    zero_targets,
-                    reduction="none",
-                    pos_weight=pos_weight,
-                )
-                loss_raw = loss_raw[valid_mask[b]]
-                if loss_raw.numel() == 0:
-                    best_losses.append(diar_logits.new_tensor(0.0))
-                else:
-                    best_losses.append(loss_raw.mean())
-                matched_pred_indices_all.append([])
-                matched_tgt_indices_all.append([])
+            if not bool(vm.any().item()):
+                assignments.append([])
+                sample_losses.append(logits_b.new_tensor(0.0))
                 continue
 
-            # predicted query candidates
-            pred_idx = list(range(N_pred))
-            tgt_idx = tgt_present_idx
+            active_target_idx = torch.where(target_b[vm].sum(dim=0) > 0)[0]
+            aligned_b = torch.zeros(time_steps, num_pred, dtype=target_b.dtype, device=device)
+            matched_pairs: list[tuple[int, int]] = []
 
-            # choose num_present predicted queries out of N_pred
-            # and permute them to target speakers
-            # cost may be high if N_pred is large; keep N_pred moderate
-            best_loss_b = None
-            best_pred_subset = None
-            best_tgt_perm = None
+            if active_target_idx.numel() > 0 and num_pred > 0:
+                active_targets = target_b[:, active_target_idx]  # [T, N_active]
+                cost = self._pairwise_bce_cost(
+                    diar_logits=logits_b,
+                    target_matrix=active_targets,
+                    valid_mask=vm,
+                )  # [N_pred, N_active]
 
-            for pred_subset in itertools.combinations(pred_idx, num_present):
-                pred_subset = list(pred_subset)
+                row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+                for pred_idx, active_col in zip(row_ind.tolist(), col_ind.tolist()):
+                    target_idx = int(active_target_idx[active_col].item())
+                    aligned_b[:, pred_idx] = target_b[:, target_idx]
+                    exist_targets[batch_idx, pred_idx] = 1.0
+                    matched_pairs.append((int(pred_idx), target_idx))
 
-                targets_sel_all = targets[b, :, tgt_idx]            # [T, S]
+            loss_raw = F.binary_cross_entropy_with_logits(
+                logits_b,
+                aligned_b,
+                reduction="none",
+                pos_weight=pos_weight,
+            )
+            loss_b = loss_raw[vm].mean()
 
-                for tgt_perm in itertools.permutations(range(num_present)):
-                    candidate_targets = torch.zeros_like(diar_logits[b])    # [T, N_pred]
-                    for pred_q, local_tgt_idx in zip(pred_subset, tgt_perm):
-                        candidate_targets[:, pred_q] = targets_sel_all[:, local_tgt_idx]
+            aligned_targets[batch_idx] = aligned_b
+            assignments.append(matched_pairs)
+            sample_losses.append(loss_b)
 
-                    loss_raw = F.binary_cross_entropy_with_logits(
-                        diar_logits[b],
-                        candidate_targets,
-                        reduction="none",
-                        pos_weight=pos_weight,
-                    )  # [T, N_pred]
+        loss = torch.stack(sample_losses).mean() if sample_losses else diar_logits.new_tensor(0.0)
 
-                    loss_raw = loss_raw[valid_mask[b]]
-                    if loss_raw.numel() == 0:
-                        loss_val = diar_logits.new_tensor(0.0)
-                    else:
-                        loss_val = loss_raw.mean()
-
-                    if best_loss_b is None or loss_val < best_loss_b:
-                        best_loss_b = loss_val
-                        best_pred_subset = pred_subset
-                        best_tgt_perm = [tgt_idx[i] for i in tgt_perm]
-
-            assert best_pred_subset is not None
-            assert best_tgt_perm is not None
-
-            best_losses.append(best_loss_b)
-
-            # build aligned targets in predicted query space
-            for pred_q, tgt_q in zip(best_pred_subset, best_tgt_perm):
-                aligned_targets[b, :, pred_q] = targets[b, :, tgt_q]
-                exist_targets[b, pred_q] = 1.0
-
-            matched_pred_indices_all.append(best_pred_subset)
-            matched_tgt_indices_all.append(best_tgt_perm)
-
-        loss = torch.stack(best_losses).mean()
-
-        if not return_perm:
-            return loss
-
-        perm_info = {
-            "matched_pred_indices": matched_pred_indices_all,
-            "matched_tgt_indices": matched_tgt_indices_all,
-            "exist_targets": exist_targets,
-        }
-        return loss, aligned_targets, perm_info
+        if return_perm:
+            perm_info = {
+                "exist_targets": exist_targets,
+                "assignments": assignments,
+            }
+            return loss, aligned_targets, perm_info
+        return loss

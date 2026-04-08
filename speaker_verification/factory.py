@@ -26,12 +26,13 @@ def build_model(cfg, device):
 def build_loss(cfg, device):
     loss_fn = MultiTaskLoss(
         pit_pos_weight=cfg.loss.pit_pos_weight,
-        exist_pos_weight=getattr(cfg.loss, "exist_pos_weight", None),
         activity_pos_weight=getattr(cfg.loss, "activity_pos_weight", None),
+        exist_pos_weight=getattr(cfg.loss, "exist_pos_weight", None),
+        exist_focal_gamma=getattr(cfg.loss, "exist_focal_gamma", 2.0),
         lambda_activity=getattr(cfg.loss, "lambda_activity", 0.5),
+        lambda_dice=getattr(cfg.loss, "lambda_dice", 0.5),
+        lambda_consistency=getattr(cfg.loss, "lambda_consistency", 0.2),
         lambda_exist=cfg.loss.lambda_exist,
-        lambda_pull=cfg.loss.lambda_pull,
-        lambda_sep=cfg.loss.lambda_sep,
         lambda_smooth=cfg.loss.lambda_smooth,
     )
     return loss_fn.to(device)

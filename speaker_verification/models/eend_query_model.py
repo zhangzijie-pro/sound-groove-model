@@ -70,11 +70,10 @@ class EENDQueryModel(nn.Module):
             diar_logits: [B,T,N]
             activity_logits: [B,T]
         """
-        frame_embeds = self.encoder(x)
+        frame_embeds = self.encoder(x, valid_mask=valid_mask)
         memory_key_padding_mask = None
         if valid_mask is not None:
             valid_mask = valid_mask.bool()
-            frame_embeds = frame_embeds * valid_mask.unsqueeze(-1).float()
             memory_key_padding_mask = ~valid_mask
         attractors, exist_logits = self.decoder(
             frame_embeds,

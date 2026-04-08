@@ -29,11 +29,12 @@ loss:
   pit_pos_weight: 1.2
   activity_pos_weight: 1.0
   exist_pos_weight: 1.0
+  exist_focal_gamma: 2.0
 
   lambda_activity: 0.5
+  lambda_dice: 0.5
+  lambda_consistency: 0.2
   lambda_exist: 1.0
-  lambda_pull: 0.2
-  lambda_sep: 0.1
   lambda_smooth: 0.03
 
 train:

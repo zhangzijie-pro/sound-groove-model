@@ -88,17 +88,17 @@ def build_history():
     return {
         "train_loss": [],
         "train_pit_loss": [],
+        "train_dice_loss": [],
         "train_activity_loss": [],
         "train_exist_loss": [],
-        "train_pull_loss": [],
-        "train_sep_loss": [],
+        "train_consistency_loss": [],
         "train_smooth_loss": [],
         "val_loss": [],
         "val_pit_loss": [],
+        "val_dice_loss": [],
         "val_activity_loss": [],
         "val_exist_loss": [],
-        "val_pull_loss": [],
-        "val_sep_loss": [],
+        "val_consistency_loss": [],
         "val_smooth_loss": [],
         "val_der": [],
         "val_count_acc": [],
@@ -113,18 +113,18 @@ def build_history():
 def append_history(history, train_stats, val_stats):
     history["train_loss"].append(train_stats["loss"])
     history["train_pit_loss"].append(train_stats["pit_loss"])
+    history["train_dice_loss"].append(train_stats["dice_loss"])
     history["train_activity_loss"].append(train_stats["activity_loss"])
     history["train_exist_loss"].append(train_stats["exist_loss"])
-    history["train_pull_loss"].append(train_stats["pull_loss"])
-    history["train_sep_loss"].append(train_stats["sep_loss"])
+    history["train_consistency_loss"].append(train_stats["consistency_loss"])
     history["train_smooth_loss"].append(train_stats["smooth_loss"])
 
     history["val_loss"].append(val_stats["val_loss"])
     history["val_pit_loss"].append(val_stats["pit_loss"])
+    history["val_dice_loss"].append(val_stats["dice_loss"])
     history["val_activity_loss"].append(val_stats["activity_loss"])
     history["val_exist_loss"].append(val_stats["exist_loss"])
-    history["val_pull_loss"].append(val_stats["pull_loss"])
-    history["val_sep_loss"].append(val_stats["sep_loss"])
+    history["val_consistency_loss"].append(val_stats["consistency_loss"])
     history["val_smooth_loss"].append(val_stats["smooth_loss"])
     history["val_der"].append(val_stats["der"])
     history["val_count_acc"].append(val_stats["count_acc"])
@@ -138,29 +138,29 @@ def append_history(history, train_stats, val_stats):
 def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
     logger.info(
         "[Epoch %d] LR=%.6e | "
-        "TrainLoss=%.4f | PIT=%.4f | Act=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f",
+        "TrainLoss=%.4f | PIT=%.4f | Dice=%.4f | Act=%.4f | Exist=%.4f | Cons=%.4f | Smooth=%.6f",
         epoch,
         lr,
         train_stats["loss"],
         train_stats["pit_loss"],
+        train_stats["dice_loss"],
         train_stats["activity_loss"],
         train_stats["exist_loss"],
-        train_stats["pull_loss"],
-        train_stats["sep_loss"],
+        train_stats["consistency_loss"],
         train_stats["smooth_loss"],
     )
 
     logger.info(
         "[Epoch %d] "
-        "ValLoss=%.4f | PIT=%.4f | Act=%.4f | Exist=%.4f | Pull=%.4f | Sep=%.4f | Smooth=%.6f | "
+        "ValLoss=%.4f | PIT=%.4f | Dice=%.4f | Act=%.4f | Exist=%.4f | Cons=%.4f | Smooth=%.6f | "
         "DER=%.2f%% | CAcc=%.2f%% | CMAE=%.4f | ActF1=%.2f%% | ExistAcc=%.2f%%",
         epoch,
         val_stats["val_loss"],
         val_stats["pit_loss"],
+        val_stats["dice_loss"],
         val_stats["activity_loss"],
         val_stats["exist_loss"],
-        val_stats["pull_loss"],
-        val_stats["sep_loss"],
+        val_stats["consistency_loss"],
         val_stats["smooth_loss"],
         val_stats["der"],
         val_stats["count_acc"] * 100.0,
