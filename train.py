@@ -88,18 +88,10 @@ def build_history():
     return {
         "train_loss": [],
         "train_pit_loss": [],
-        "train_dice_loss": [],
-        "train_activity_loss": [],
         "train_exist_loss": [],
-        "train_consistency_loss": [],
-        "train_smooth_loss": [],
         "val_loss": [],
         "val_pit_loss": [],
-        "val_dice_loss": [],
-        "val_activity_loss": [],
         "val_exist_loss": [],
-        "val_consistency_loss": [],
-        "val_smooth_loss": [],
         "val_der": [],
         "val_count_acc": [],
         "val_count_mae": [],
@@ -107,25 +99,19 @@ def build_history():
         "val_act_rec": [],
         "val_act_f1": [],
         "val_exist_acc": [],
+        "val_sweep_der": [],
+        "val_sweep_threshold": [],
     }
 
 
 def append_history(history, train_stats, val_stats):
     history["train_loss"].append(train_stats["loss"])
     history["train_pit_loss"].append(train_stats["pit_loss"])
-    history["train_dice_loss"].append(train_stats["dice_loss"])
-    history["train_activity_loss"].append(train_stats["activity_loss"])
     history["train_exist_loss"].append(train_stats["exist_loss"])
-    history["train_consistency_loss"].append(train_stats["consistency_loss"])
-    history["train_smooth_loss"].append(train_stats["smooth_loss"])
 
     history["val_loss"].append(val_stats["val_loss"])
     history["val_pit_loss"].append(val_stats["pit_loss"])
-    history["val_dice_loss"].append(val_stats["dice_loss"])
-    history["val_activity_loss"].append(val_stats["activity_loss"])
     history["val_exist_loss"].append(val_stats["exist_loss"])
-    history["val_consistency_loss"].append(val_stats["consistency_loss"])
-    history["val_smooth_loss"].append(val_stats["smooth_loss"])
     history["val_der"].append(val_stats["der"])
     history["val_count_acc"].append(val_stats["count_acc"])
     history["val_count_mae"].append(val_stats.get("count_mae", 0.0))
@@ -133,35 +119,27 @@ def append_history(history, train_stats, val_stats):
     history["val_act_rec"].append(val_stats["act_rec"])
     history["val_act_f1"].append(val_stats["act_f1"])
     history["val_exist_acc"].append(val_stats["exist_acc"])
+    history["val_sweep_der"].append(val_stats.get("sweep_der"))
+    history["val_sweep_threshold"].append(val_stats.get("sweep_threshold"))
 
 
 def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
     logger.info(
-        "[Epoch %d] LR=%.6e | "
-        "TrainLoss=%.4f | PIT=%.4f | Dice=%.4f | Act=%.4f | Exist=%.4f | Cons=%.4f | Smooth=%.6f",
+        "[Epoch %d] LR=%.6e | TrainLoss=%.4f | PIT=%.4f | Exist=%.4f",
         epoch,
         lr,
         train_stats["loss"],
         train_stats["pit_loss"],
-        train_stats["dice_loss"],
-        train_stats["activity_loss"],
         train_stats["exist_loss"],
-        train_stats["consistency_loss"],
-        train_stats["smooth_loss"],
     )
 
     logger.info(
-        "[Epoch %d] "
-        "ValLoss=%.4f | PIT=%.4f | Dice=%.4f | Act=%.4f | Exist=%.4f | Cons=%.4f | Smooth=%.6f | "
-        "DER=%.2f%% | CAcc=%.2f%% | CMAE=%.4f | ActF1=%.2f%% | ExistAcc=%.2f%%",
+        "[Epoch %d] ValLoss=%.4f | PIT=%.4f | Exist=%.4f | DER=%.2f%% | "
+        "CAcc=%.2f%% | CMAE=%.4f | ActF1=%.2f%% | ExistAcc=%.2f%%",
         epoch,
         val_stats["val_loss"],
         val_stats["pit_loss"],
-        val_stats["dice_loss"],
-        val_stats["activity_loss"],
         val_stats["exist_loss"],
-        val_stats["consistency_loss"],
-        val_stats["smooth_loss"],
         val_stats["der"],
         val_stats["count_acc"] * 100.0,
         val_stats.get("count_mae", 0.0),
@@ -178,6 +156,35 @@ def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
         val_stats["der_detail"]["gt_active"],
         val_stats["der_detail"]["pred_active"],
     )
+    if "sweep_der" in val_stats:
+        logger.info(
+            "[Epoch %d] Sweep DER | Best=%.2f%% @ speaker_activity_threshold=%.2f | detail=%s",
+            epoch,
+            val_stats["sweep_der"],
+            val_stats["sweep_threshold"],
+            val_stats.get("sweep_detail", {}),
+        )
+
+
+def should_treat_as_collapse(cfg: DictConfig, val_stats: dict) -> bool:
+    der = float(val_stats.get("der", 0.0))
+    act_f1 = float(val_stats.get("act_f1", 0.0))
+    pred_active = float(val_stats.get("der_detail", {}).get("pred_active", 0.0))
+    gt_active = float(val_stats.get("der_detail", {}).get("gt_active", 0.0))
+    der_threshold = float(getattr(cfg.train, "collapse_der_threshold", 0.0))
+    act_f1_threshold = float(getattr(cfg.train, "collapse_act_f1_threshold", 0.0))
+    pred_active_threshold = float(getattr(cfg.train, "collapse_pred_active_threshold", 0.0))
+
+    if gt_active <= 0:
+        return False
+
+    if der_threshold > 0.0 and der >= der_threshold:
+        return True
+    if act_f1_threshold > 0.0 and act_f1 <= act_f1_threshold:
+        return True
+    if pred_active_threshold > 0.0 and pred_active <= pred_active_threshold:
+        return True
+    return False
 
 
 def maybe_load_finetune_weights(cfg, model, device, logger) -> float:
@@ -295,6 +302,8 @@ def main(cfg: DictConfig):
     last_ckpt = os.path.join(cfg.output.save_dir, "last.pt")
     best_ckpt = os.path.join(cfg.output.save_dir, "best.pt")
     history_json = os.path.join(cfg.output.save_dir, "history.json")
+    early_stop_patience = int(getattr(cfg.train, "early_stop_patience", 2))
+    epochs_without_improvement = 0
 
     for epoch in range(start_epoch, cfg.train.epochs + 1):
         logger.info("=" * 80)
@@ -317,7 +326,7 @@ def main(cfg: DictConfig):
             device=device,
             max_batches=cfg.validate.max_batches,
             speaker_activity_threshold=getattr(cfg.validate, "speaker_activity_threshold", getattr(cfg.validate, "activity_threshold", 0.6)),
-            frame_activity_threshold=getattr(cfg.validate, "frame_activity_threshold", 0.5),
+            speaker_activity_sweep_thresholds=getattr(cfg.validate, "speaker_activity_sweep_thresholds", None),
             exist_threshold=cfg.validate.exist_threshold,
             min_active_frames=cfg.validate.min_active_frames,
         )
@@ -339,7 +348,17 @@ def main(cfg: DictConfig):
             cfg,
         )
 
-        monitor_value = val_stats[cfg.output.monitor]
+        monitor_name = str(cfg.output.monitor)
+        if monitor_name not in val_stats:
+            fallback_monitor = "der" if "der" in val_stats else "val_loss"
+            logger.warning(
+                "Monitor '%s' not found in validation stats. Fallback to '%s'.",
+                monitor_name,
+                fallback_monitor,
+            )
+            monitor_name = fallback_monitor
+
+        monitor_value = val_stats[monitor_name]
         improved = (
             monitor_value < best_metric
             if cfg.output.monitor_mode == "min"
@@ -348,6 +367,7 @@ def main(cfg: DictConfig):
 
         if improved:
             best_metric = monitor_value
+            epochs_without_improvement = 0
             save_checkpoint(
                 best_ckpt,
                 model,
@@ -362,9 +382,35 @@ def main(cfg: DictConfig):
                 "[Epoch %d] New best checkpoint saved: %s | %s=%.6f",
                 epoch,
                 best_ckpt,
-                cfg.output.monitor,
+                monitor_name,
                 monitor_value,
             )
+        else:
+            epochs_without_improvement += 1
+
+        if should_treat_as_collapse(cfg, val_stats):
+            logger.warning(
+                "[Epoch %d] Collapse detected. DER=%.2f%% ActF1=%.2f%% PredActive=%.2f. Stop and keep best checkpoint.",
+                epoch,
+                float(val_stats.get("der", 0.0)),
+                float(val_stats.get("act_f1", 0.0)) * 100.0,
+                float(val_stats.get("der_detail", {}).get("pred_active", 0.0)),
+            )
+            if os.path.isfile(best_ckpt):
+                best_state = get_model_state_from_ckpt(torch.load(best_ckpt, map_location=device))
+                model.load_state_dict(best_state, strict=True)
+            break
+
+        if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+            logger.info(
+                "[Epoch %d] Early stopping triggered after %d epochs without improvement. Keep best checkpoint.",
+                epoch,
+                epochs_without_improvement,
+            )
+            if os.path.isfile(best_ckpt):
+                best_state = get_model_state_from_ckpt(torch.load(best_ckpt, map_location=device))
+                model.load_state_dict(best_state, strict=True)
+            break
 
         with open(history_json, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)

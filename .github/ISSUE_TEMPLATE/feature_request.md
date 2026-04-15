@@ -22,7 +22,8 @@ Pick the workload this request is for:
 - meeting analysis
 - long-audio monitoring
 - training / finetuning
-- speaker bank / open-set identification
+- pretrained EEND inference
+- checkpoint export
 - packaging / release engineering
 - other
 

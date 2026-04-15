@@ -39,10 +39,8 @@ def _remove_short_runs(binary_seq: torch.Tensor, min_active_frames: int = 3) -> 
 def _decode_predictions(
     diar_logits: torch.Tensor,
     exist_logits: torch.Tensor,
-    activity_logits: torch.Tensor,
     valid_mask: torch.Tensor,
     speaker_activity_threshold: float = 0.6,
-    frame_activity_threshold: float = 0.5,
     exist_threshold: float = 0.5,
     min_active_frames: int = 3,
 ):
@@ -52,7 +50,6 @@ def _decode_predictions(
     Args:
         diar_logits: [T, N]
         exist_logits: [N]
-        activity_logits: [T]
         valid_mask: [T]
 
     Returns:
@@ -64,28 +61,29 @@ def _decode_predictions(
     """
     diar_prob = torch.sigmoid(diar_logits)          # [T,N]
     exist_prob = torch.sigmoid(exist_logits)        # [N]
-    frame_activity_prob = torch.sigmoid(activity_logits)  # [T]
 
     keep_mask = exist_prob >= exist_threshold       # [N]
+    if not bool(keep_mask.any().item()):
+        # Avoid all-zero collapse when existence head briefly becomes over-conservative.
+        keep_mask = diar_prob.max(dim=0).values >= speaker_activity_threshold
+
     pred_exist = keep_mask.float()
     pred_count = int(keep_mask.sum().item())
-    pred_activity = (frame_activity_prob >= frame_activity_threshold).float()
-    pred_activity = _remove_short_runs(pred_activity, min_active_frames=min_active_frames)
 
     pred_bin_full = torch.zeros_like(diar_prob, dtype=torch.float32)
 
     if pred_count > 0:
         pred_bin_full[:, keep_mask] = (diar_prob[:, keep_mask] >= speaker_activity_threshold).float()
-
-        # light smoothing on each active query stream
         for n in range(pred_bin_full.size(1)):
             if bool(keep_mask[n].item()):
                 pred_bin_full[:, n] = _remove_short_runs(
-                    pred_bin_full[:, n] * pred_activity,
+                    pred_bin_full[:, n],
                     min_active_frames=min_active_frames,
                 )
 
     pred_bin_full = pred_bin_full * valid_mask.unsqueeze(-1).float()
+    pred_activity = (pred_bin_full.sum(dim=-1) > 0).float()
+    pred_activity = _remove_short_runs(pred_activity, min_active_frames=min_active_frames)
     pred_activity = pred_activity * valid_mask.float()
 
     return pred_bin_full, pred_count, pred_activity, pred_exist, keep_mask
@@ -99,7 +97,7 @@ def validate(
     device,
     max_batches: int = -1,
     speaker_activity_threshold: float = 0.6,
-    frame_activity_threshold: float = 0.5,
+    speaker_activity_sweep_thresholds=None,
     exist_threshold: float = 0.5,
     min_active_frames: int = 3,
 ):
@@ -107,13 +105,13 @@ def validate(
 
     val_loss_meter = AverageMeter()
     pit_meter = AverageMeter()
-    dice_meter = AverageMeter()
-    activity_meter = AverageMeter()
     exist_meter = AverageMeter()
-    consistency_meter = AverageMeter()
-    smooth_meter = AverageMeter()
 
     der_tracker = DERTracker()
+    sweep_thresholds = []
+    if speaker_activity_sweep_thresholds is not None:
+        sweep_thresholds = sorted({float(thr) for thr in speaker_activity_sweep_thresholds})
+    sweep_trackers = {thr: DERTracker() for thr in sweep_thresholds}
 
     count_acc_sum = 0.0
     count_acc_n = 0
@@ -141,19 +139,15 @@ def validate(
         target_count = batch["target_count"].to(device, non_blocking=True)    # [B]
         valid_mask = batch["valid_mask"].to(device, non_blocking=True)        # [B,T]
 
-        frame_embeds, attractors, exist_logits, diar_logits, activity_logits = model(
+        _, _, exist_logits, diar_logits, _ = model(
             fbank,
             valid_mask=valid_mask,
         )
 
         loss_dict = loss_fn(
-            frame_embeds=frame_embeds,
-            attractors=attractors,
             exist_logits=exist_logits,
             diar_logits=diar_logits,
-            activity_logits=activity_logits,
             target_matrix=target_matrix,
-            target_count=target_count,
             valid_mask=valid_mask,
             return_detail=True,
         )
@@ -162,11 +156,7 @@ def validate(
 
         val_loss_meter.update(float(loss_dict["total"].item()), bs)
         pit_meter.update(float(loss_dict["pit_loss"].item()), bs)
-        dice_meter.update(float(loss_dict["dice_loss"].item()), bs)
-        activity_meter.update(float(loss_dict["activity_loss"].item()), bs)
         exist_meter.update(float(loss_dict["exist_loss"].item()), bs)
-        consistency_meter.update(float(loss_dict["consistency_loss"].item()), bs)
-        smooth_meter.update(float(loss_dict["smooth_loss"].item()), bs)
 
         # ------------------------------------------------------------
         # 1) decoded DER aligned with inference-time gating
@@ -177,10 +167,8 @@ def validate(
             pred_bin_full, _, pred_activity, _, _ = _decode_predictions(
                 diar_logits=diar_logits[b],
                 exist_logits=exist_logits[b],
-                activity_logits=activity_logits[b],
                 valid_mask=valid_mask[b],
                 speaker_activity_threshold=speaker_activity_threshold,
-                frame_activity_threshold=frame_activity_threshold,
                 exist_threshold=exist_threshold,
                 min_active_frames=min_active_frames,
             )
@@ -197,6 +185,32 @@ def validate(
             return_detail=True,
         )
         der_tracker.update(der_info)
+
+        for sweep_thr, sweep_tracker in sweep_trackers.items():
+            if abs(sweep_thr - float(speaker_activity_threshold)) < 1e-9:
+                sweep_tracker.update(der_info)
+                continue
+
+            sweep_preds = []
+            for b in range(bs):
+                pred_bin_full, _, _, _, _ = _decode_predictions(
+                    diar_logits=diar_logits[b],
+                    exist_logits=exist_logits[b],
+                    valid_mask=valid_mask[b],
+                    speaker_activity_threshold=sweep_thr,
+                    exist_threshold=exist_threshold,
+                    min_active_frames=min_active_frames,
+                )
+                sweep_preds.append(pred_bin_full)
+
+            sweep_pred_batch = torch.stack(sweep_preds, dim=0)
+            _, sweep_info = diarization_error_rate_decoded(
+                sweep_pred_batch,
+                target_matrix,
+                valid_mask=valid_mask,
+                return_detail=True,
+            )
+            sweep_tracker.update(sweep_info)
 
         # ------------------------------------------------------------
         # 2) count / existence metrics
@@ -246,8 +260,7 @@ def validate(
         pbar.set_postfix(
             total=f"{val_loss_meter.avg:.4f}",
             pit=f"{pit_meter.avg:.4f}",
-            dice=f"{dice_meter.avg:.4f}",
-            act=f"{activity_meter.avg:.4f}",
+            exist=f"{exist_meter.avg:.4f}",
             der=f"{der_tracker.value() * 100.0:.2f}%",
             cacc=f"{(count_acc_sum / max(count_acc_n, 1)) * 100.0:.2f}%",
             cmae=f"{(count_mae_sum / max(count_mae_n, 1)):.3f}",
@@ -256,15 +269,23 @@ def validate(
         )
 
     der_detail = der_tracker.detail()
+    sweep_detail = {
+        str(thr): tracker.detail()["der"] * 100.0
+        for thr, tracker in sweep_trackers.items()
+    }
+    if sweep_detail:
+        best_sweep_threshold, best_sweep_der = min(
+            ((float(thr), der) for thr, der in sweep_detail.items()),
+            key=lambda item: item[1],
+        )
+    else:
+        best_sweep_threshold = None
+        best_sweep_der = None
 
     out = {
         "val_loss": val_loss_meter.avg,
         "pit_loss": pit_meter.avg,
-        "dice_loss": dice_meter.avg,
-        "activity_loss": activity_meter.avg,
         "exist_loss": exist_meter.avg,
-        "consistency_loss": consistency_meter.avg,
-        "smooth_loss": smooth_meter.avg,
         "der": der_detail["der"] * 100.0,
         "der_detail": {
             "fa": der_detail["fa"],
@@ -280,4 +301,8 @@ def validate(
         "act_f1": act_f1_sum / max(1, act_n),
         "exist_acc": exist_acc_sum / max(1, exist_acc_n),
     }
+    if best_sweep_der is not None:
+        out["sweep_der"] = best_sweep_der
+        out["sweep_threshold"] = best_sweep_threshold
+        out["sweep_detail"] = sweep_detail
     return out

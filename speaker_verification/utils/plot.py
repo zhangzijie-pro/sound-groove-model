@@ -57,11 +57,7 @@ def plot_curves(out_dir: str, history: dict):
         "loss",
         [
             ("train_pit_loss", "train_pit"),
-            ("train_dice_loss", "train_dice"),
-            ("train_activity_loss", "train_activity"),
             ("train_exist_loss", "train_exist"),
-            ("train_consistency_loss", "train_consistency"),
-            ("train_smooth_loss", "train_smooth"),
         ],
     )
 
@@ -74,11 +70,7 @@ def plot_curves(out_dir: str, history: dict):
         "loss",
         [
             ("val_pit_loss", "val_pit"),
-            ("val_dice_loss", "val_dice"),
-            ("val_activity_loss", "val_activity"),
             ("val_exist_loss", "val_exist"),
-            ("val_consistency_loss", "val_consistency"),
-            ("val_smooth_loss", "val_smooth"),
         ],
     )
 

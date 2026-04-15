@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,10 +10,11 @@ from scipy.optimize import linear_sum_assignment
 
 class PITDiarizationLoss(nn.Module):
     """
-    Hungarian-aligned diarization BCE.
+    Hungarian-aligned PIT BCE for EEND-style diarization.
 
-    This keeps the training objective permutation-invariant without using
-    factorial enumeration over all speaker-query assignments.
+    The prediction speaker axis is an unordered query/attractor axis. This loss
+    aligns active target speakers to prediction slots per sample and returns the
+    aligned speaker-existence targets used by MultiTaskLoss.
     """
 
     def __init__(self, pos_weight: float = 1.0):
@@ -22,20 +27,11 @@ class PITDiarizationLoss(nn.Module):
         target_matrix: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            diar_logits: [T, N_pred]
-            target_matrix: [T, N_tgt]
-            valid_mask: [T]
-
-        Returns:
-            cost: [N_pred, N_tgt]
-        """
         if target_matrix.size(1) == 0:
             return diar_logits.new_zeros(diar_logits.size(1), 0)
 
-        pred = diar_logits.unsqueeze(-1)           # [T, N_pred, 1]
-        tgt = target_matrix.unsqueeze(-2)          # [T, 1, N_tgt]
+        pred = diar_logits.unsqueeze(-1)
+        tgt = target_matrix.unsqueeze(-2)
         pred = pred.expand(-1, -1, target_matrix.size(1))
         tgt = tgt.expand(-1, diar_logits.size(1), -1)
 
@@ -58,17 +54,6 @@ class PITDiarizationLoss(nn.Module):
         valid_mask: torch.Tensor | None = None,
         return_perm: bool = False,
     ):
-        """
-        Args:
-            diar_logits: [B, T, N_pred]
-            target_matrix: [B, T, N_tgt]
-            valid_mask: [B, T]
-
-        Returns:
-            loss
-            aligned_targets: [B, T, N_pred]
-            perm_info: {"exist_targets": [B, N_pred], "assignments": list}
-        """
         device = diar_logits.device
         target_matrix = target_matrix.float().to(device)
 
@@ -91,15 +76,15 @@ class PITDiarizationLoss(nn.Module):
             dtype=target_matrix.dtype,
             device=device,
         )
-        assignments: list[list[tuple[int, int]]] = []
+        assignments: List[List[Tuple[int, int]]] = []
         sample_losses = []
 
         pos_weight = torch.tensor(self.pos_weight, device=device)
 
         for batch_idx in range(batch_size):
             vm = valid_mask[batch_idx]
-            logits_b = diar_logits[batch_idx]      # [T, N_pred]
-            target_b = target_matrix[batch_idx]    # [T, N_tgt]
+            logits_b = diar_logits[batch_idx]
+            target_b = target_matrix[batch_idx]
 
             if not bool(vm.any().item()):
                 assignments.append([])
@@ -108,15 +93,15 @@ class PITDiarizationLoss(nn.Module):
 
             active_target_idx = torch.where(target_b[vm].sum(dim=0) > 0)[0]
             aligned_b = torch.zeros(time_steps, num_pred, dtype=target_b.dtype, device=device)
-            matched_pairs: list[tuple[int, int]] = []
+            matched_pairs: List[Tuple[int, int]] = []
 
             if active_target_idx.numel() > 0 and num_pred > 0:
-                active_targets = target_b[:, active_target_idx]  # [T, N_active]
+                active_targets = target_b[:, active_target_idx]
                 cost = self._pairwise_bce_cost(
                     diar_logits=logits_b,
                     target_matrix=active_targets,
                     valid_mask=vm,
-                )  # [N_pred, N_active]
+                )
 
                 row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
                 for pred_idx, active_col in zip(row_ind.tolist(), col_ind.tolist()):
@@ -131,18 +116,16 @@ class PITDiarizationLoss(nn.Module):
                 reduction="none",
                 pos_weight=pos_weight,
             )
-            loss_b = loss_raw[vm].mean()
-
+            sample_losses.append(loss_raw[vm].mean())
             aligned_targets[batch_idx] = aligned_b
             assignments.append(matched_pairs)
-            sample_losses.append(loss_b)
 
         loss = torch.stack(sample_losses).mean() if sample_losses else diar_logits.new_tensor(0.0)
 
         if return_perm:
-            perm_info = {
+            return loss, aligned_targets, {
                 "exist_targets": exist_targets,
                 "assignments": assignments,
             }
-            return loss, aligned_targets, perm_info
         return loss
+

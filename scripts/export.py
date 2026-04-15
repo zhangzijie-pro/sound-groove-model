@@ -1,238 +1,234 @@
-import os
-import time
-import json
+from __future__ import annotations
+
 import argparse
+import json
 import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import Any, Mapping
 
 import torch
-import onnx
 
-import sys
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-
-sys.path.append(project_root)
-
-from speaker_verification.models.resowave import ResoWave
+from speaker_verification.engine.checkpoint import get_model_state_from_ckpt
+from speaker_verification.inference import build_model_from_config
 
 
-class Config:
-    def __init__(self):
-        self.__start_time = time.time()
-        self.min_memory = 1024 * 1024 * 1024  # 1GB
+def torch_load(path: Path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
-    def get_spend_time(self):
-        seconds = int(time.time() - self.__start_time)
+
+def default_config() -> dict[str, Any]:
+    return {
+        "model": {
+            "in_channels": 80,
+            "channels": 512,
+            "d_model": 256,
+            "max_mix_speakers": 3,
+            "assign_scale": 8.0,
+            "decoder_type": "query",
+            "decoder_layers": 4,
+            "decoder_heads": 8,
+            "decoder_ffn": 512,
+            "dropout": 0.1,
+            "post_ffn_hidden_dim": 512,
+            "post_ffn_dropout": 0.2,
+        },
+        "data": {"crop_sec": 4.0},
+        "validate": {
+            "speaker_activity_threshold": 0.55,
+            "exist_threshold": 0.5,
+            "min_active_frames": 5,
+        },
+    }
+
+
+class EENDExportWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, fbank: torch.Tensor, valid_mask: torch.Tensor):
+        frame_embeds, _, exist_logits, diar_logits, activity_logits = self.model(
+            fbank,
+            valid_mask=valid_mask.bool(),
+        )
+        return frame_embeds, exist_logits, diar_logits, activity_logits
+
+
+class EENDModelExporter:
+    def __init__(self, ckpt_path: str, out_dir: str, device: str = "auto"):
+        self.start_time = time.time()
+        self.ckpt_path = Path(ckpt_path).expanduser().resolve()
+        if not self.ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {self.ckpt_path}")
+
+        self.out_dir = Path(out_dir).expanduser().resolve()
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.device = self.select_device(device)
+
+        self.ckpt = torch_load(self.ckpt_path, map_location=self.device)
+        self.config = self.load_config(self.ckpt)
+        self.model = build_model_from_config(self.config, self.device)
+        self.model.load_state_dict(get_model_state_from_ckpt(self.ckpt), strict=True)
+        self.model.eval()
+        self.wrapper = EENDExportWrapper(self.model).to(self.device).eval()
+
+        print(f"[export] model=EENDQueryModel")
+        print(f"[export] checkpoint={self.ckpt_path}")
+        print(f"[export] output={self.out_dir}")
+        print(f"[export] device={self.device}")
+
+    @staticmethod
+    def select_device(device: str) -> torch.device:
+        if device and device != "auto":
+            return torch.device(device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    @staticmethod
+    def load_config(ckpt: Any) -> Mapping[str, Any]:
+        if isinstance(ckpt, dict) and isinstance(ckpt.get("config"), Mapping):
+            return ckpt["config"]
+        return default_config()
+
+    def elapsed(self) -> str:
+        seconds = int(time.time() - self.start_time)
         h = seconds // 3600
         m = (seconds % 3600) // 60
         s = seconds % 60
         return f"{h:02d}h {m:02d}m {s:02d}s"
 
-    def get_device(self):
-        if not torch.cuda.is_available():
-            return torch.device("cpu")
+    def dummy_inputs(self, batch_size: int, frames: int):
+        in_channels = int(self.config.get("model", {}).get("in_channels", 80))
+        fbank = torch.randn(batch_size, frames, in_channels, device=self.device)
+        valid_mask = torch.ones(batch_size, frames, dtype=torch.bool, device=self.device)
+        return fbank, valid_mask
 
-        max_free = -1
-        best_gpu = 0
-        for i in range(torch.cuda.device_count()):
-            free = torch.cuda.get_device_properties(i).total_memory - torch.cuda.memory_reserved(i)
-            if free > max_free:
-                max_free = free
-                best_gpu = i
+    def split_checkpoint(self) -> None:
+        model_state = get_model_state_from_ckpt(self.ckpt)
+        torch.save(model_state, self.out_dir / "model_state.pt")
 
-        free_mb = max_free / (1024 * 1024)
-        if free_mb < 1024:
-            print(f"⚠️ GPU {best_gpu} 剩余 {free_mb:.1f}MB → 使用 CPU")
-            return torch.device("cpu")
-        return torch.device(f"cuda:{best_gpu}")
-
-
-class ModelExporter:
-    """统一模型导出类"""
-    def __init__(self, ckpt_path: str, out_dir: str = "outputs/export"):
-        self.ckpt_path = Path(ckpt_path)
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-
-        self.config = Config()
-        self.device = self.config.get_device()
-
-        self.model = None
-        self.head = None
-        self.emb_dim = 256
-        self.channels = 512
-
-        print(f"[{self.__class__.__name__}] Device: {self.device}")
-
-    def split_checkpoint(self):
-        """拆分 best.pt → model.pt"""
-        print("正在拆分 checkpoint...")
-        ckpt = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
-
-        model_state = ckpt["model_state"]
-
-        model_path = self.out_dir / "model.pt"
-        torch.save(model_state, model_path)
-        print(f"✓ model saved → {model_path}")
+        with (self.out_dir / "config.json").open("w", encoding="utf-8") as handle:
+            json.dump(self.config, handle, ensure_ascii=False, indent=2)
 
         meta = {
-            "emb_dim": self.emb_dim,
-            "channels": self.channels,
+            "model_type": "EENDQueryModel",
+            "task": "speaker_diarization",
+            "original_checkpoint": str(self.ckpt_path),
+            "epoch": self.ckpt.get("epoch") if isinstance(self.ckpt, dict) else None,
+            "best_metric": self.ckpt.get("best_metric") if isinstance(self.ckpt, dict) else None,
             "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "original_ckpt": str(self.ckpt_path),
+            "inputs": ["fbank", "valid_mask"],
+            "outputs": ["frame_embeds", "exist_logits", "diar_logits", "activity_logits"],
         }
-        with open(self.out_dir / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
+        with (self.out_dir / "export_meta.json").open("w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False, indent=2)
 
-    def split_single_head(self, ckpt_path, out_dir):
-        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        print("[export] wrote model_state.pt, config.json, export_meta.json")
 
-        full_state_dict = ckpt["model_state"]
-
-        diar_model = ResoWave(
-            in_channels=80,
-            channels=512,
-            embd_dim=256,
-            max_mix_speakers=4
+    def export_torchscript(self, batch_size: int, frames: int) -> None:
+        fbank, valid_mask = self.dummy_inputs(batch_size, frames)
+        traced = torch.jit.trace(
+            self.wrapper,
+            (fbank, valid_mask),
+            strict=False,
+            check_trace=False,
         )
+        ts_path = self.out_dir / "model.ts"
+        traced.save(str(ts_path))
+        print(f"[export] torchscript saved: {ts_path}")
 
-        new_state_dict = {}
-        keep_prefixes = ['layer1.', 'layer2.', 'layer3.', 'layer4.', 'diar_head.']
+    def export_onnx(self, batch_size: int, frames: int, opset: int) -> None:
+        try:
+            import onnx
+        except ImportError as exc:
+            raise RuntimeError("ONNX export requires `pip install onnx`.") from exc
 
-        for k, v in full_state_dict.items():
-            if any(k.startswith(prefix) for prefix in keep_prefixes):
-                new_state_dict[k] = v
-
-        missing, unexpected = diar_model.load_state_dict(new_state_dict, strict=False)
-
-        print(f"Missing : {missing}, unexpected: {unexpected}")
-
-        out_ckpt_path = os.path.join(out_dir, "resowave_clear.pt")
-
-        torch.save({
-            'model_state_dict': diar_model.state_dict()
-        }, out_ckpt_path)
-
-        print(f"\n🎉 拆分完成")
-
-    def load_model(self):
-        print("加载 ResoWave...")
-        self.model = ResoWave(
-            in_channels=80,
-            channels=self.channels,
-            embd_dim=self.emb_dim,
-        ).to(self.device)
-
-        state_dict = torch.load(self.out_dir / "model.pt", map_location="cpu")
-        self.model.load_state_dict(state_dict, strict=True)
-        self.model.eval()
-        print("✓ 模型加载完成")
-
-    def export_onnx(self, dummy_batch: int = 1, dummy_frames: int = 400, opset: int = 17):
-        self.load_model()
-
-        dummy_input = torch.randn(dummy_batch, dummy_frames, 80).to(self.device)
-
+        fbank, valid_mask = self.dummy_inputs(batch_size, frames)
         onnx_path = self.out_dir / "model.onnx"
-        print(f"正在导出 ONNX → {onnx_path} (opset={opset})")
-
         torch.onnx.export(
-            self.model,
-            dummy_input,
-            onnx_path,
-            input_names=["fbank"],
-            output_names=["embedding"],
+            self.wrapper,
+            (fbank, valid_mask),
+            str(onnx_path),
+            input_names=["fbank", "valid_mask"],
+            output_names=["frame_embeds", "exist_logits", "diar_logits", "activity_logits"],
             dynamic_axes={
-                "fbank": {0: "batch_size", 1: "time_frames"},
-                "embedding": {0: "batch_size"}
+                "fbank": {0: "batch", 1: "frames"},
+                "valid_mask": {0: "batch", 1: "frames"},
+                "frame_embeds": {0: "batch", 1: "frames"},
+                "exist_logits": {0: "batch"},
+                "diar_logits": {0: "batch", 1: "frames"},
+                "activity_logits": {0: "batch", 1: "frames"},
             },
             opset_version=opset,
             do_constant_folding=True,
-            verbose=False,
         )
-
-        onnx_model = onnx.load(onnx_path)
+        onnx_model = onnx.load(str(onnx_path))
         onnx.checker.check_model(onnx_model)
-        print(f"✓ ONNX 导出成功！文件大小: {onnx_path.stat().st_size / (1024*1024):.1f} MB")
+        print(f"[export] onnx saved: {onnx_path}")
 
-    def export_mnn(self, fp16: bool = True, optimize: int = 1):
-        """导出 MNN（需先安装 mnn: pip install mnn）"""
-        if not (self.out_dir / "model.onnx").exists():
-            print("请先执行 --onnx")
-            return
+    def export_mnn(self, fp16: bool = True, optimize: int = 1) -> None:
+        onnx_path = self.out_dir / "model.onnx"
+        if not onnx_path.is_file():
+            raise FileNotFoundError("MNN export requires model.onnx. Run with --onnx first.")
 
         mnn_path = self.out_dir / "model.mnn"
-        fp16_flag = "--fp16" if fp16 else ""
-        cmd = f"mnnconvert -f ONNX --modelFile {self.out_dir}/model.onnx " \
-              f"--MNNModel {mnn_path} {fp16_flag} --optimizePrefer {optimize}"
+        cmd = [
+            "mnnconvert",
+            "-f",
+            "ONNX",
+            "--modelFile",
+            str(onnx_path),
+            "--MNNModel",
+            str(mnn_path),
+            "--optimizePrefer",
+            str(optimize),
+        ]
+        if fp16:
+            cmd.append("--fp16")
+        subprocess.run(cmd, check=True)
+        print(f"[export] mnn saved: {mnn_path}")
 
-        print(f"正在转换 MNN → {mnn_path}")
-        try:
-            subprocess.run(cmd, shell=True, check=True, capture_output=True)
-            print(f"✓ MNN 导出成功！")
-        except subprocess.CalledProcessError as e:
-            print("MNN 转换失败（请确认已安装 mnn）")
-            print(e.stderr.decode())
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Export EENDQueryModel checkpoint artifacts.")
+    parser.add_argument("--ckpt", default="outputs_trainali_synth/best.pt", help="Checkpoint path.")
+    parser.add_argument("--out_dir", default="outputs/export", help="Export output directory.")
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N.")
+    parser.add_argument("--split", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--torchscript", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--onnx", action="store_true", default=False)
+    parser.add_argument("--mnn", action="store_true", default=False)
+    parser.add_argument("--dummy_batch", type=int, default=1)
+    parser.add_argument("--dummy_frames", type=int, default=398)
+    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Speaker Verification 模型导出工具")
-    
-    parser.add_argument("--ckpt", type=str, required=True,
-                        help="输入 checkpoint 路径 (best.pt)")
-    
-    parser.add_argument("--out_dir", type=str, default="outputs/export",
-                        help="导出目录 (默认: outputs/export)")
-    
-    parser.add_argument("--split", action=argparse.BooleanOptionalAction, default=True,
-                        help="是否拆分 checkpoint (默认: True)")
-    
-    parser.add_argument("--split_pithy", action="store_true", default=False,
-                        help="是否拆分 checkpoint 为简洁版 (默认: False)")
-    
-    parser.add_argument("--onnx", action=argparse.BooleanOptionalAction, default=True,
-                        help="是否导出 ONNX (默认: True)")
-    
-    parser.add_argument("--mnn", action="store_true", default=False,
-                        help="是否导出 MNN (需先 --onnx)")
-    
-    parser.add_argument("--dummy_batch", type=int, default=1,
-                        help="ONNX dummy batch size")
-    
-    parser.add_argument("--dummy_frames", type=int, default=400,
-                        help="ONNX dummy frames (约4秒音频)")
-    
-    parser.add_argument("--opset", type=int, default=17,
-                        help="ONNX opset version")
-    
-    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
-                        help="MNN 使用 FP16")
-
-    args = parser.parse_args()
-
-    exporter = ModelExporter(ckpt_path=args.ckpt, out_dir=args.out_dir)
+def main() -> None:
+    args = parse_args()
+    exporter = EENDModelExporter(args.ckpt, args.out_dir, device=args.device)
 
     if args.split:
         exporter.split_checkpoint()
-
-    if args.split_pithy:
-        exporter.split_single_head(ckpt_path=args.ckpt, out_dir=args.out_dir)
-
+    if args.torchscript:
+        exporter.export_torchscript(args.dummy_batch, args.dummy_frames)
     if args.onnx:
-        exporter.export_onnx(
-            dummy_batch=args.dummy_batch,
-            dummy_frames=args.dummy_frames,
-            opset=args.opset
-        )
-
+        exporter.export_onnx(args.dummy_batch, args.dummy_frames, args.opset)
     if args.mnn:
         exporter.export_mnn(fp16=args.fp16)
 
     print("=" * 60)
-    print(f"导出完成！耗时: {exporter.config.get_spend_time()}")
-    print(f"输出目录: {args.out_dir}")
+    print(f"Export finished in {exporter.elapsed()}")
+    print(f"Output directory: {exporter.out_dir}")
     print("=" * 60)
 
 

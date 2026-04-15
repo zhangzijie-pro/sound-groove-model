@@ -44,10 +44,10 @@ Paste logs here
 ## Artifact Details
 
 - Checkpoint schema version:
-- Data schema version:
 - Input sample rate / duration:
 - `max_mix_speakers`:
-- Speaker bank used:
+- Checkpoint path:
+- Inference/export entrypoint:
 
 ## Additional Context
 

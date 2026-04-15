@@ -205,6 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.DS_Store
 *.wav
 CN-Celeb_flac/
 processed/real_diar_dataset/
@@ -212,3 +213,4 @@ processed/real_diar_dataset/
 outputs/
 eval_staticmix/
 outputs_lstm_neg_signle_sample_finetune/
+outputs_trainali_synth/

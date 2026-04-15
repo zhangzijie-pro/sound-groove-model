@@ -11,7 +11,8 @@ model:
   in_channels: 80
   channels: 512
   d_model: 256
-  max_mix_speakers: 8
+  max_mix_speakers: 3
+  assign_scale: 8.0
 
   # decoder type: query / eda_lstm
   decoder_type: query
@@ -19,52 +20,48 @@ model:
   # query decoder
   decoder_layers: 4
   decoder_heads: 8
-  decoder_ffn: 1024
+  decoder_ffn: 512
 
   dropout: 0.1
-  post_ffn_hidden_dim: 1024
-  post_ffn_dropout: 0.1
+  post_ffn_hidden_dim: 512
+  post_ffn_dropout: 0.2
 
 loss:
   pit_pos_weight: 1.2
-  activity_pos_weight: 1.0
-  exist_pos_weight: 1.0
-  exist_focal_gamma: 2.0
-
-  lambda_activity: 0.5
-  lambda_dice: 0.5
-  lambda_consistency: 0.2
-  lambda_exist: 1.0
-  lambda_smooth: 0.03
+  exist_pos_weight: 1.5
+  lambda_exist: 0.1
 
 train:
   seed: 42
   device: cuda
 
-  batch_size: 8
-  num_workers: 4
+  batch_size: 32
+  num_workers: 0
 
-  epochs: 80
-  lr: 1.0e-4
+  epochs: 150
+  lr: 5.0e-5
   min_lr: 1.0e-6
   weight_decay: 1.0e-4
-  grad_clip: 5.0
+  grad_clip: 1.0
 
   use_scheduler: true
-  warmup_epochs: 5
+  warmup_epochs: 1
   warmup_start_factor: 0.1
+  early_stop_patience: 0
+  collapse_der_threshold: 0.0
+  collapse_act_f1_threshold: 0.0
+  collapse_pred_active_threshold: 0.0
 
 validate:
-  batch_size: 8
+  batch_size: 16
   max_batches: -1
 
-  speaker_activity_threshold: 0.60
-  frame_activity_threshold: 0.50
+  speaker_activity_threshold: 0.55
   exist_threshold: 0.5
   min_active_frames: 5
 
 output:
-  save_dir: outputs_e2e/
+  save_dir: outputs_trainali_synth/
   plot_history: true
 
   # recommended: der / val_loss

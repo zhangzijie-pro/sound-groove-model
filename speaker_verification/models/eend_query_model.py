@@ -14,6 +14,7 @@ class EENDQueryModel(nn.Module):
         enc_channels=512,
         d_model=256,
         max_speakers=6,
+        assign_scale=8.0,
         decoder_type="query",
         post_ffn_hidden_dim=1024,
         post_ffn_dropout=0.1,
@@ -51,7 +52,7 @@ class EENDQueryModel(nn.Module):
         else:
             raise ValueError(f"Unsupported decoder_type: {decoder_type}")
 
-        self.assign_head = DotProductDiarizationHead(scale=d_model ** 0.5)
+        self.assign_head = DotProductDiarizationHead(scale=assign_scale)
         self.activity_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
