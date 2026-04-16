@@ -117,7 +117,6 @@ def hungarian_match_logits(diar_logits, target_matrix, valid_mask=None):
 def diarization_error_rate_pit(
     diar_logits,
     target_matrix,
-    target_activity=None,
     valid_mask=None,
     return_detail=False,
 ):
