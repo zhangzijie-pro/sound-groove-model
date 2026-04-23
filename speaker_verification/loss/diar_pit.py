@@ -26,6 +26,7 @@ class PITDiarizationLoss(nn.Module):
         diar_logits: torch.Tensor,
         target_matrix: torch.Tensor,
         valid_mask: torch.Tensor,
+        frame_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if target_matrix.size(1) == 0:
             return diar_logits.new_zeros(diar_logits.size(1), 0)
@@ -44,6 +45,11 @@ class PITDiarizationLoss(nn.Module):
         )
 
         mask = valid_mask.unsqueeze(-1).unsqueeze(-1).float()
+        if frame_weights is not None:
+            weight_mask = mask * frame_weights.view(-1, 1, 1).float()
+            denom = (valid_mask.float() * frame_weights.float()).sum().clamp(min=1.0)
+            return (bce * weight_mask).sum(dim=0) / denom
+
         denom = valid_mask.sum().clamp(min=1).float()
         return (bce * mask).sum(dim=0) / denom
 
@@ -52,6 +58,7 @@ class PITDiarizationLoss(nn.Module):
         diar_logits: torch.Tensor,
         target_matrix: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        frame_weights: torch.Tensor | None = None,
         return_perm: bool = False,
     ):
         device = diar_logits.device
@@ -62,6 +69,10 @@ class PITDiarizationLoss(nn.Module):
             valid_mask = torch.ones(batch_size, time_steps, dtype=torch.bool, device=device)
         else:
             valid_mask = valid_mask.bool().to(device)
+        if frame_weights is None:
+            frame_weights = torch.ones(batch_size, time_steps, dtype=torch.float32, device=device)
+        else:
+            frame_weights = frame_weights.float().to(device)
 
         aligned_targets = torch.zeros(
             batch_size,
@@ -83,6 +94,7 @@ class PITDiarizationLoss(nn.Module):
 
         for batch_idx in range(batch_size):
             vm = valid_mask[batch_idx]
+            fw = frame_weights[batch_idx]
             logits_b = diar_logits[batch_idx]
             target_b = target_matrix[batch_idx]
 
@@ -101,6 +113,7 @@ class PITDiarizationLoss(nn.Module):
                     diar_logits=logits_b,
                     target_matrix=active_targets,
                     valid_mask=vm,
+                    frame_weights=fw,
                 )
 
                 row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
@@ -116,7 +129,8 @@ class PITDiarizationLoss(nn.Module):
                 reduction="none",
                 pos_weight=pos_weight,
             )
-            sample_losses.append(loss_raw[vm].mean())
+            weighted_loss = loss_raw * fw.unsqueeze(-1)
+            sample_losses.append(weighted_loss[vm].mean())
             aligned_targets[batch_idx] = aligned_b
             assignments.append(matched_pairs)
 
@@ -128,4 +142,3 @@ class PITDiarizationLoss(nn.Module):
                 "assignments": assignments,
             }
         return loss
-

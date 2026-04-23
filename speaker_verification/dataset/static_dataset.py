@@ -29,6 +29,8 @@ class StaticMixDataset(Dataset):
         shuffle: bool = True,
         crop_mode: str = "random",
         max_speakers: int | None = None,
+        same_session_train_prob: float | None = None,
+        same_session_val_prob: float | None = None,
     ):
         super().__init__()
         self.out_dir = Path(out_dir).expanduser().resolve()
@@ -39,6 +41,8 @@ class StaticMixDataset(Dataset):
         self.crop_mode = str(crop_mode)
         if self.crop_mode not in {"random", "center", "start"}:
             raise ValueError(f"Unsupported crop_mode: {self.crop_mode}")
+        self.same_session_train_prob_override = same_session_train_prob
+        self.same_session_val_prob_override = same_session_val_prob
 
         spk2id_path = self.out_dir / "spk2id.json"
         if spk2id_path.is_file():
@@ -66,8 +70,10 @@ class StaticMixDataset(Dataset):
         self.min_source_sec = 1.2
         self.max_source_sec = 3.6
         self.max_offset_sec = 2.5
-        self.same_session_train_prob = 0.75
+        self.same_session_train_prob = 0.50 if same_session_train_prob is None else float(same_session_train_prob)
         self.same_session_val_prob = 1.0
+        if same_session_val_prob is not None:
+            self.same_session_val_prob = float(same_session_val_prob)
         self.gain_db_low = -2.0
         self.gain_db_high = 2.0
         self.source_rms = 0.05
@@ -77,6 +83,25 @@ class StaticMixDataset(Dataset):
         self.mix_rms = 0.06
         self.mix_rms_jitter_db = 1.5
         self.vox_max_crop_retry = 8
+        self.soft_boundary_frames = 3
+        self.synthetic_rir_prob = 0.35
+        self.babble_noise_prob = 0.40
+        self.babble_noise_snr_choices = [10.0, 15.0, 20.0]
+        self.secondary_sir_db_choices = [-9.0, -6.0, -3.0, 0.0, 3.0, 6.0]
+        self.secondary_sir_db_weights = [0.22, 0.24, 0.18, 0.16, 0.12, 0.08]
+        self.training_bucket_names = [
+            "single_clean",
+            "two_weak_overlap",
+            "two_strong_overlap",
+            "three_speaker",
+        ]
+        self.training_bucket_weights = [0.30, 0.25, 0.30, 0.15]
+        self.overlap_ratio_ranges = {
+            "single_clean": (0.0, 0.0),
+            "two_weak_overlap": (0.10, 0.30),
+            "two_strong_overlap": (0.30, 0.70),
+            "three_speaker": (0.20, 0.55),
+        }
 
         self.speaker_count_choices: List[int] = [1]
         self.speaker_count_weights: List[float] = [1.0]
@@ -142,6 +167,10 @@ class StaticMixDataset(Dataset):
         self.max_offset_sec = float(ali_cfg.get("max_offset_sec", self.max_offset_sec))
         self.same_session_train_prob = max(0.0, min(float(ali_cfg.get("same_session_train_prob", self.same_session_train_prob)), 1.0))
         self.same_session_val_prob = max(0.0, min(float(ali_cfg.get("same_session_val_prob", self.same_session_val_prob)), 1.0))
+        if self.same_session_train_prob_override is not None:
+            self.same_session_train_prob = max(0.0, min(float(self.same_session_train_prob_override), 1.0))
+        if self.same_session_val_prob_override is not None:
+            self.same_session_val_prob = max(0.0, min(float(self.same_session_val_prob_override), 1.0))
         self.gain_db_low = float(ali_cfg.get("gain_db_low", self.gain_db_low))
         self.gain_db_high = float(ali_cfg.get("gain_db_high", self.gain_db_high))
         self.source_rms = float(ali_cfg.get("source_rms", self.source_rms))
@@ -297,11 +326,23 @@ class StaticMixDataset(Dataset):
             + float(frame_length) / 2.0
         ) / float(self.target_sr)
         activity = torch.zeros(num_frames, dtype=torch.float32)
+        ramp_sec = self.soft_boundary_frames * float(frame_shift) / float(self.target_sr)
         for seg_start, seg_end in segments:
             if seg_end - seg_start <= 0.0:
                 continue
-            active = (centers >= float(seg_start)) & (centers <= float(seg_end))
-            activity[active] = 1.0
+            seg_start = float(seg_start)
+            seg_end = float(seg_end)
+            if ramp_sec <= 0.0:
+                active = (centers >= seg_start) & (centers <= seg_end)
+                activity[active] = 1.0
+                continue
+
+            left = ((centers - (seg_start - ramp_sec)) / max(ramp_sec, 1e-6)).clamp(0.0, 1.0)
+            right = (((seg_end + ramp_sec) - centers) / max(ramp_sec, 1e-6)).clamp(0.0, 1.0)
+            seg_activity = torch.minimum(left, right)
+            interior = (centers >= seg_start) & (centers <= seg_end)
+            seg_activity[interior] = 1.0
+            activity = torch.maximum(activity, seg_activity)
         return activity
 
     def _crop_segments(
@@ -372,6 +413,10 @@ class StaticMixDataset(Dataset):
         wav = wav * (10.0 ** (rng.uniform(self.gain_db_low, self.gain_db_high) / 20.0))
         return wav
 
+    @staticmethod
+    def _apply_gain_db(wav: torch.Tensor, gain_db: float) -> torch.Tensor:
+        return wav * (10.0 ** (float(gain_db) / 20.0))
+
     def _normalize_mix_wave(self, wav: torch.Tensor, rng) -> torch.Tensor:
         rms = wav.pow(2).mean().sqrt()
         if float(rms.item()) > 1e-6:
@@ -381,6 +426,98 @@ class StaticMixDataset(Dataset):
         if float(peak.item()) > 0.99:
             wav = wav / peak * 0.99
         return wav
+
+    def _sample_training_bucket(self, rng) -> str:
+        if self.max_mix < 3:
+            choices = self.training_bucket_names[:3]
+            weights = self.training_bucket_weights[:3]
+            total = sum(weights)
+            weights = [w / total for w in weights]
+            return str(self._sample_weighted(choices, weights, rng))
+        return str(self._sample_weighted(self.training_bucket_names, self.training_bucket_weights, rng))
+
+    def _speaker_count_for_bucket(self, bucket_name: str) -> int:
+        if bucket_name == "single_clean":
+            return 1
+        if bucket_name in {"two_weak_overlap", "two_strong_overlap"}:
+            return min(2, self.max_mix)
+        return min(3, self.max_mix)
+
+    def _sample_secondary_sir_db(self, rng) -> float:
+        return float(self._sample_weighted(self.secondary_sir_db_choices, self.secondary_sir_db_weights, rng))
+
+    def _solve_offset_for_overlap(self, primary_duration_sec: float, source_duration_sec: float, overlap_ratio: float) -> float:
+        overlap_sec = min(primary_duration_sec, source_duration_sec) * max(0.0, min(overlap_ratio, 0.95))
+        candidate = max(0.0, primary_duration_sec - overlap_sec)
+        return max(0.0, min(self.chunk_sec - source_duration_sec, candidate))
+
+    def _sample_offsets_for_bucket(self, bucket_name: str, durations: Sequence[float], rng) -> List[float]:
+        if len(durations) <= 1:
+            return [0.0 for _ in durations]
+
+        ratio_low, ratio_high = self.overlap_ratio_ranges[bucket_name]
+        primary_duration_sec = float(durations[0])
+        offsets = [0.0]
+        for source_duration_sec in durations[1:]:
+            overlap_ratio = rng.uniform(ratio_low, ratio_high)
+            offsets.append(self._solve_offset_for_overlap(primary_duration_sec, float(source_duration_sec), overlap_ratio))
+        return offsets
+
+    def _make_synthetic_rir(self, rng) -> torch.Tensor:
+        rir_len = rng.randint(int(0.03 * self.target_sr), int(0.12 * self.target_sr))
+        time_axis = torch.linspace(0.0, 1.0, steps=rir_len, dtype=torch.float32)
+        decay = torch.exp(-time_axis * rng.uniform(4.0, 8.0))
+        rir = torch.randn(rir_len, dtype=torch.float32) * decay * 0.03
+        rir[0] += 1.0
+
+        for _ in range(rng.randint(2, 5)):
+            pos = rng.randint(1, rir_len - 1)
+            rir[pos] += rng.uniform(0.05, 0.25)
+
+        rir = rir / rir.abs().sum().clamp(min=1e-6)
+        return rir
+
+    def _maybe_apply_synthetic_rir(self, wav: torch.Tensor, rng) -> torch.Tensor:
+        if not self.is_train_manifest or rng.random() >= self.synthetic_rir_prob:
+            return wav
+        rir = self._make_synthetic_rir(rng).to(wav.device)
+        out = F.conv1d(
+            wav.view(1, 1, -1),
+            rir.flip(0).view(1, 1, -1),
+            padding=rir.numel() - 1,
+        ).view(-1)
+        return out[: wav.numel()]
+
+    def _sample_babble_noise(self, rng) -> torch.Tensor:
+        if not self.ali_entries:
+            return torch.zeros(self.chunk_samples, dtype=torch.float32)
+
+        babble = torch.zeros(self.chunk_samples, dtype=torch.float32)
+        noise_sources = rng.randint(1, 2)
+        for _ in range(noise_sources):
+            entry = rng.choice(self.ali_entries)
+            noise_dur = rng.uniform(1.0, min(self.chunk_sec, 2.5))
+            crop_start_sec = self._pick_crop_start(entry, noise_dur, rng)
+            wav = self._load_crop_wave(entry, crop_start_sec, noise_dur)
+            start_sample = rng.randint(0, max(0, self.chunk_samples - wav.numel()))
+            end_sample = min(self.chunk_samples, start_sample + wav.numel())
+            babble[start_sample:end_sample] += wav[: end_sample - start_sample]
+        return babble
+
+    def _maybe_add_babble_noise(self, mix_wav: torch.Tensor, rng) -> torch.Tensor:
+        if not self.is_train_manifest or rng.random() >= self.babble_noise_prob:
+            return mix_wav
+
+        noise = self._sample_babble_noise(rng)
+        noise_rms = noise.pow(2).mean().sqrt()
+        mix_rms = mix_wav.pow(2).mean().sqrt()
+        if float(noise_rms.item()) <= 1e-6 or float(mix_rms.item()) <= 1e-6:
+            return mix_wav
+
+        snr_db = rng.choice(self.babble_noise_snr_choices)
+        target_noise_rms = mix_rms / (10.0 ** (float(snr_db) / 20.0))
+        noise = noise * (target_noise_rms / noise_rms.clamp(min=1e-6))
+        return mix_wav + noise
 
     def _load_crop_wave(self, entry: Dict[str, Any], crop_start_sec: float, crop_sec: float) -> torch.Tensor:
         source_sr = int(entry.get("sample_rate", self.target_sr))
@@ -500,8 +637,9 @@ class StaticMixDataset(Dataset):
                 target_matrix = F.pad(target_matrix, (0, 0, 0, fbank.size(0) - expected_frames))
 
         valid_mask = torch.ones(fbank.size(0), dtype=torch.bool)
-        target_activity = (target_matrix.sum(dim=-1) > 0).float()
-        speaker_presence = (target_matrix.sum(dim=0) > 0).float()
+        target_matrix = target_matrix.clamp(0.0, 1.0)
+        target_activity = target_matrix.max(dim=-1).values.clamp(0.0, 1.0)
+        speaker_presence = (target_matrix.max(dim=0).values > 0.25).float()
         target_count = int(speaker_presence.sum().item())
 
         return {
@@ -515,26 +653,27 @@ class StaticMixDataset(Dataset):
         }
 
     def _build_ali_item(self, idx: int, rng) -> Dict[str, Any]:
-        count = self._sample_speaker_count(rng)
+        bucket_name = self._sample_training_bucket(rng)
+        count = self._speaker_count_for_bucket(bucket_name)
         selected_entries, is_same_session = self._select_ali_entries(rng, count)
 
         num_frames = self._num_feature_frames()
         mix_wav = torch.zeros(self.chunk_samples, dtype=torch.float32)
         target_matrix = torch.zeros(num_frames, self.max_mix, dtype=torch.float32)
 
-        shared_crop_start_sec = 0.0
-        if is_same_session:
-            shared_crop_start_sec = self._pick_group_crop_start(selected_entries, self.chunk_sec, rng)
+        if bucket_name == "single_clean":
+            source_durations = [self.chunk_sec]
+        else:
+            source_durations = [self._sample_source_duration(count, rng) for _ in range(count)]
+            source_durations[0] = max(source_durations[0], min(self.chunk_sec, 2.4))
+        offsets = self._sample_offsets_for_bucket(bucket_name, source_durations, rng)
+
+        del is_same_session
 
         for speaker_slot, entry in enumerate(selected_entries):
-            if is_same_session:
-                source_duration_sec = self.chunk_sec
-                crop_start_sec = shared_crop_start_sec
-                offset_sec = 0.0
-            else:
-                source_duration_sec = self._sample_source_duration(count, rng)
-                crop_start_sec = self._pick_crop_start(entry, source_duration_sec, rng)
-                offset_sec = self._sample_offset(source_duration_sec, speaker_slot, rng)
+            source_duration_sec = source_durations[speaker_slot]
+            crop_start_sec = self._pick_crop_start(entry, source_duration_sec, rng)
+            offset_sec = offsets[speaker_slot]
 
             wav = self._load_crop_wave(entry, crop_start_sec, source_duration_sec)
             source_segments = self._crop_segments(
@@ -547,6 +686,9 @@ class StaticMixDataset(Dataset):
             source_mask = self._segments_to_sample_mask(source_segments, wav.numel(), max(source_duration_sec, 1e-6))
             wav = self._apply_focus_mask(wav, source_mask)
             wav = self._normalize_source_wave(wav, source_mask, rng)
+            if speaker_slot > 0 and bucket_name != "single_clean":
+                wav = self._apply_gain_db(wav, self._sample_secondary_sir_db(rng))
+            wav = self._maybe_apply_synthetic_rir(wav, rng)
 
             start_sample = int(round(offset_sec * self.target_sr))
             end_sample = min(self.chunk_samples, start_sample + wav.numel())
@@ -561,6 +703,7 @@ class StaticMixDataset(Dataset):
             )
             target_matrix[:, speaker_slot] = self._segments_to_activity(mixed_segments, num_frames)
 
+        mix_wav = self._maybe_add_babble_noise(mix_wav, rng)
         mix_wav = self._normalize_mix_wave(mix_wav, rng)
         return self._build_item_from_targets(mix_wav, target_matrix)
 

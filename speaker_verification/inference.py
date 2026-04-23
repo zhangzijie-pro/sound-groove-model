@@ -195,6 +195,7 @@ class SpeakerDiarizationPipeline:
             if speaker_activity_threshold is not None
             else _cfg_get(self.config, "validate.speaker_activity_threshold", 0.55)
         )
+        self.frame_activity_threshold = float(_cfg_get(self.config, "validate.frame_activity_threshold", 0.5))
         self.exist_threshold = float(
             exist_threshold
             if exist_threshold is not None
@@ -242,8 +243,9 @@ class SpeakerDiarizationPipeline:
             chunk = fbank[start:end].unsqueeze(0).to(self.device)
             valid_mask = torch.ones(1, chunk.size(1), dtype=torch.bool, device=self.device)
 
-            _, _, exist_logits, diar_logits, _ = self.model(chunk, valid_mask=valid_mask)
+            _, _, exist_logits, diar_logits, activity_logits = self.model(chunk, valid_mask=valid_mask)
             diar_prob = torch.sigmoid(diar_logits[0]).detach().cpu()
+            activity_prob = torch.sigmoid(activity_logits[0]).detach().cpu()
             exist_prob = torch.sigmoid(exist_logits[0]).detach().cpu()
 
             keep_mask = exist_prob >= self.exist_threshold
@@ -252,6 +254,8 @@ class SpeakerDiarizationPipeline:
 
             gated_prob = diar_prob.clone()
             gated_prob[:, ~keep_mask] = 0.0
+            frame_gate = (activity_prob >= self.frame_activity_threshold).float().unsqueeze(-1)
+            gated_prob = gated_prob * frame_gate
             prob_sum[start:end] += gated_prob[: end - start]
             prob_count[start:end] += 1.0
 

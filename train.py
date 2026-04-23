@@ -88,10 +88,14 @@ def build_history():
     return {
         "train_loss": [],
         "train_pit_loss": [],
+        "train_activity_loss": [],
         "train_exist_loss": [],
+        "train_diversity_loss": [],
         "val_loss": [],
         "val_pit_loss": [],
+        "val_activity_loss": [],
         "val_exist_loss": [],
+        "val_diversity_loss": [],
         "val_der": [],
         "val_count_acc": [],
         "val_count_mae": [],
@@ -107,11 +111,15 @@ def build_history():
 def append_history(history, train_stats, val_stats):
     history["train_loss"].append(train_stats["loss"])
     history["train_pit_loss"].append(train_stats["pit_loss"])
+    history["train_activity_loss"].append(train_stats["activity_loss"])
     history["train_exist_loss"].append(train_stats["exist_loss"])
+    history["train_diversity_loss"].append(train_stats["diversity_loss"])
 
     history["val_loss"].append(val_stats["val_loss"])
     history["val_pit_loss"].append(val_stats["pit_loss"])
+    history["val_activity_loss"].append(val_stats["activity_loss"])
     history["val_exist_loss"].append(val_stats["exist_loss"])
+    history["val_diversity_loss"].append(val_stats["diversity_loss"])
     history["val_der"].append(val_stats["der"])
     history["val_count_acc"].append(val_stats["count_acc"])
     history["val_count_mae"].append(val_stats.get("count_mae", 0.0))
@@ -125,21 +133,25 @@ def append_history(history, train_stats, val_stats):
 
 def log_epoch_stats(logger, epoch, train_stats, val_stats, lr):
     logger.info(
-        "[Epoch %d] LR=%.6e | TrainLoss=%.4f | PIT=%.4f | Exist=%.4f",
+        "[Epoch %d] LR=%.6e | TrainLoss=%.4f | PIT=%.4f | Act=%.4f | Exist=%.4f | Div=%.4f",
         epoch,
         lr,
         train_stats["loss"],
         train_stats["pit_loss"],
+        train_stats["activity_loss"],
         train_stats["exist_loss"],
+        train_stats["diversity_loss"],
     )
 
     logger.info(
-        "[Epoch %d] ValLoss=%.4f | PIT=%.4f | Exist=%.4f | DER=%.2f%% | "
+        "[Epoch %d] ValLoss=%.4f | PIT=%.4f | Act=%.4f | Exist=%.4f | Div=%.4f | DER=%.2f%% | "
         "CAcc=%.2f%% | CMAE=%.4f | ActF1=%.2f%% | ExistAcc=%.2f%%",
         epoch,
         val_stats["val_loss"],
         val_stats["pit_loss"],
+        val_stats["activity_loss"],
         val_stats["exist_loss"],
+        val_stats["diversity_loss"],
         val_stats["der"],
         val_stats["count_acc"] * 100.0,
         val_stats.get("count_mae", 0.0),
@@ -326,6 +338,7 @@ def main(cfg: DictConfig):
             device=device,
             max_batches=cfg.validate.max_batches,
             speaker_activity_threshold=getattr(cfg.validate, "speaker_activity_threshold", getattr(cfg.validate, "activity_threshold", 0.6)),
+            frame_activity_threshold=getattr(cfg.validate, "frame_activity_threshold", 0.5),
             speaker_activity_sweep_thresholds=getattr(cfg.validate, "speaker_activity_sweep_thresholds", None),
             exist_threshold=cfg.validate.exist_threshold,
             min_active_frames=cfg.validate.min_active_frames,

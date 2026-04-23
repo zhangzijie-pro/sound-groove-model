@@ -6,12 +6,14 @@ data:
   train_manifest: train_manifest.jsonl
   val_manifest: val_manifest.jsonl
   crop_sec: 4.0
+  same_session_train_prob: 0.5
+  same_session_val_prob: 1.0
 
 model:
   in_channels: 80
   channels: 512
   d_model: 256
-  max_mix_speakers: 3
+  max_mix_speakers: 4
   assign_scale: 8.0
 
   # decoder type: query / eda_lstm
@@ -30,8 +32,14 @@ model:
 
 loss:
   pit_pos_weight: 1.2
+  activity_pos_weight: 1.2
   exist_pos_weight: 1.5
+  exist_focal_gamma: 2.0
   lambda_exist: 0.1
+  lambda_activity: 0.3
+  lambda_diversity: 0.02
+  overlap_weight_2spk: 2.0
+  overlap_weight_3spk: 3.0
 
 train:
   seed: 42
@@ -59,6 +67,7 @@ validate:
   max_batches: -1
 
   speaker_activity_threshold: 0.55
+  frame_activity_threshold: 0.5
   exist_threshold: 0.5
   min_active_frames: 5
 

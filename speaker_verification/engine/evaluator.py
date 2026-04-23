@@ -39,8 +39,10 @@ def _remove_short_runs(binary_seq: torch.Tensor, min_active_frames: int = 3) -> 
 def _decode_predictions(
     diar_logits: torch.Tensor,
     exist_logits: torch.Tensor,
+    activity_logits: torch.Tensor,
     valid_mask: torch.Tensor,
     speaker_activity_threshold: float = 0.6,
+    frame_activity_threshold: float = 0.5,
     exist_threshold: float = 0.5,
     min_active_frames: int = 3,
 ):
@@ -61,6 +63,7 @@ def _decode_predictions(
     """
     diar_prob = torch.sigmoid(diar_logits)          # [T,N]
     exist_prob = torch.sigmoid(exist_logits)        # [N]
+    frame_activity_prob = torch.sigmoid(activity_logits)
 
     keep_mask = exist_prob >= exist_threshold       # [N]
     if not bool(keep_mask.any().item()):
@@ -71,18 +74,20 @@ def _decode_predictions(
     pred_count = int(keep_mask.sum().item())
 
     pred_bin_full = torch.zeros_like(diar_prob, dtype=torch.float32)
+    frame_gate = (frame_activity_prob >= frame_activity_threshold).float()
+    frame_gate = _remove_short_runs(frame_gate, min_active_frames=min_active_frames)
 
     if pred_count > 0:
         pred_bin_full[:, keep_mask] = (diar_prob[:, keep_mask] >= speaker_activity_threshold).float()
         for n in range(pred_bin_full.size(1)):
             if bool(keep_mask[n].item()):
                 pred_bin_full[:, n] = _remove_short_runs(
-                    pred_bin_full[:, n],
+                    pred_bin_full[:, n] * frame_gate,
                     min_active_frames=min_active_frames,
                 )
 
     pred_bin_full = pred_bin_full * valid_mask.unsqueeze(-1).float()
-    pred_activity = (pred_bin_full.sum(dim=-1) > 0).float()
+    pred_activity = ((pred_bin_full.sum(dim=-1) > 0).float() * frame_gate)
     pred_activity = _remove_short_runs(pred_activity, min_active_frames=min_active_frames)
     pred_activity = pred_activity * valid_mask.float()
 
@@ -97,6 +102,7 @@ def validate(
     device,
     max_batches: int = -1,
     speaker_activity_threshold: float = 0.6,
+    frame_activity_threshold: float = 0.5,
     speaker_activity_sweep_thresholds=None,
     exist_threshold: float = 0.5,
     min_active_frames: int = 3,
@@ -105,7 +111,9 @@ def validate(
 
     val_loss_meter = AverageMeter()
     pit_meter = AverageMeter()
+    activity_meter = AverageMeter()
     exist_meter = AverageMeter()
+    diversity_meter = AverageMeter()
 
     der_tracker = DERTracker()
     sweep_thresholds = []
@@ -139,15 +147,19 @@ def validate(
         target_count = batch["target_count"].to(device, non_blocking=True)    # [B]
         valid_mask = batch["valid_mask"].to(device, non_blocking=True)        # [B,T]
 
-        _, _, exist_logits, diar_logits, _ = model(
+        frame_embeds, attractors, exist_logits, diar_logits, activity_logits = model(
             fbank,
             valid_mask=valid_mask,
         )
 
         loss_dict = loss_fn(
+            frame_embeds=frame_embeds,
+            attractors=attractors,
             exist_logits=exist_logits,
             diar_logits=diar_logits,
+            activity_logits=activity_logits,
             target_matrix=target_matrix,
+            target_count=target_count,
             valid_mask=valid_mask,
             return_detail=True,
         )
@@ -156,7 +168,9 @@ def validate(
 
         val_loss_meter.update(float(loss_dict["total"].item()), bs)
         pit_meter.update(float(loss_dict["pit_loss"].item()), bs)
+        activity_meter.update(float(loss_dict["activity_loss"].item()), bs)
         exist_meter.update(float(loss_dict["exist_loss"].item()), bs)
+        diversity_meter.update(float(loss_dict["diversity_loss"].item()), bs)
 
         # ------------------------------------------------------------
         # 1) decoded DER aligned with inference-time gating
@@ -167,8 +181,10 @@ def validate(
             pred_bin_full, _, pred_activity, _, _ = _decode_predictions(
                 diar_logits=diar_logits[b],
                 exist_logits=exist_logits[b],
+                activity_logits=activity_logits[b],
                 valid_mask=valid_mask[b],
                 speaker_activity_threshold=speaker_activity_threshold,
+                frame_activity_threshold=frame_activity_threshold,
                 exist_threshold=exist_threshold,
                 min_active_frames=min_active_frames,
             )
@@ -196,8 +212,10 @@ def validate(
                 pred_bin_full, _, _, _, _ = _decode_predictions(
                     diar_logits=diar_logits[b],
                     exist_logits=exist_logits[b],
+                    activity_logits=activity_logits[b],
                     valid_mask=valid_mask[b],
                     speaker_activity_threshold=sweep_thr,
+                    frame_activity_threshold=frame_activity_threshold,
                     exist_threshold=exist_threshold,
                     min_active_frames=min_active_frames,
                 )
@@ -260,6 +278,7 @@ def validate(
         pbar.set_postfix(
             total=f"{val_loss_meter.avg:.4f}",
             pit=f"{pit_meter.avg:.4f}",
+            act=f"{activity_meter.avg:.4f}",
             exist=f"{exist_meter.avg:.4f}",
             der=f"{der_tracker.value() * 100.0:.2f}%",
             cacc=f"{(count_acc_sum / max(count_acc_n, 1)) * 100.0:.2f}%",
@@ -285,7 +304,9 @@ def validate(
     out = {
         "val_loss": val_loss_meter.avg,
         "pit_loss": pit_meter.avg,
+        "activity_loss": activity_meter.avg,
         "exist_loss": exist_meter.avg,
+        "diversity_loss": diversity_meter.avg,
         "der": der_detail["der"] * 100.0,
         "der_detail": {
             "fa": der_detail["fa"],

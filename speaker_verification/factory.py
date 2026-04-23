@@ -28,8 +28,14 @@ def build_model(cfg, device):
 def build_loss(cfg, device):
     loss_fn = MultiTaskLoss(
         pit_pos_weight=cfg.loss.pit_pos_weight,
+        activity_pos_weight=getattr(cfg.loss, "activity_pos_weight", None),
         exist_pos_weight=cfg.loss.exist_pos_weight,
+        exist_focal_gamma=getattr(cfg.loss, "exist_focal_gamma", 2.0),
         lambda_exist=cfg.loss.lambda_exist,
+        lambda_activity=getattr(cfg.loss, "lambda_activity", 0.3),
+        lambda_diversity=getattr(cfg.loss, "lambda_diversity", 0.02),
+        overlap_weight_2spk=getattr(cfg.loss, "overlap_weight_2spk", 2.0),
+        overlap_weight_3spk=getattr(cfg.loss, "overlap_weight_3spk", 3.0),
     )
     return loss_fn.to(device)
 
@@ -52,6 +58,8 @@ def build_loaders(cfg, device):
         shuffle=True,
         crop_mode="random",
         max_speakers=cfg.model.max_mix_speakers,
+        same_session_train_prob=getattr(cfg.data, "same_session_train_prob", None),
+        same_session_val_prob=getattr(cfg.data, "same_session_val_prob", None),
     )
 
     val_set = StaticMixDataset(
@@ -61,6 +69,8 @@ def build_loaders(cfg, device):
         shuffle=False,
         crop_mode="center",
         max_speakers=cfg.model.max_mix_speakers,
+        same_session_train_prob=getattr(cfg.data, "same_session_train_prob", None),
+        same_session_val_prob=getattr(cfg.data, "same_session_val_prob", None),
     )
 
     train_loader = DataLoader(
