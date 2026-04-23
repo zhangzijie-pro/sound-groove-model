@@ -15,7 +15,9 @@ model:
   assign_scale: 8.0
 
   # decoder type: query / eda_lstm
+  # decoder_type: eda_lstm
   decoder_type: query
+
 
   # query decoder
   decoder_layers: 4
@@ -61,7 +63,7 @@ validate:
   min_active_frames: 5
 
 output:
-  save_dir: outputs_trainali_synth/
+  save_dir: outputs_trainali_vox_online_query/
   plot_history: true
 
   # recommended: der / val_loss
